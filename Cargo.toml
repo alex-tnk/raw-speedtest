@@ -53,8 +53,11 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
     "NSEnumerator",
     "NSBundle",
     "NSProcessInfo",
+    "NSAttributedString",
+    "NSGeometry",
 ] }
-# Save panel for Export and window restoration switches.
+# Save panel for Export, window restoration switches, and the optional menu
+# bar item (status item, its menu, fonts and attributed titles).
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
     "NSApplication",
@@ -65,6 +68,21 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSView",
     "NSRunningApplication",
     "NSWindowRestoration",
+    "NSStatusBar",
+    "NSStatusBarButton",
+    "NSStatusItem",
+    "NSButton",
+    "NSControl",
+    "NSCell",
+    "NSMenu",
+    "NSMenuItem",
+    "NSImage",
+    "NSFont",
+    "NSFontDescriptor",
+    "NSAttributedString",
+    "NSParagraphStyle",
+    "NSText",
+    "NSColor",
 ] }
 # Wi-Fi metrics (RSSI, noise, channel, PHY mode, transmit rate).
 objc2-core-wlan = { version = "0.3", default-features = false, features = [

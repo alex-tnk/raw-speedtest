@@ -18,9 +18,10 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, CentralPanel, Panel, Rect, ScrollArea, Ui, Visuals, vec2};
 
 use crate::app::derived::Cache;
+use crate::app::session::RunState;
 use crate::app::{Controller, Waker, export};
 use crate::model::RunMode;
-use crate::platform;
+use crate::platform::{self, TrayAction, TrayStatus};
 use charts::TimeView;
 use charts::timeseries::{Charts, Inputs};
 use controls::Action;
@@ -37,6 +38,11 @@ pub struct SpeedApp {
     notice: Option<(String, bool, Instant)>,
     window_ready: bool,
     log_tab: log::Tab,
+    /// The menu bar item is shown and closing the window keeps running.
+    /// In memory only, like every setting: the app stores nothing.
+    menu_bar: bool,
+    /// The window is closed and the app lives in the menu bar.
+    hidden: bool,
 }
 
 fn style(ctx: &egui::Context) {
@@ -106,6 +112,8 @@ impl SpeedApp {
             notice: None,
             window_ready: false,
             log_tab: log::Tab::default(),
+            menu_bar: false,
+            hidden: false,
         })
     }
 
@@ -142,6 +150,78 @@ impl SpeedApp {
         }
     }
 
+    fn set_menu_bar(&mut self, ctx: &egui::Context, on: bool) {
+        self.menu_bar = on;
+        let wake_ctx = ctx.clone();
+        platform::current().tray_set(on, Arc::new(move || wake_ctx.request_repaint()));
+        if on {
+            self.update_tray();
+        }
+    }
+
+    fn show_window(&mut self, ctx: &egui::Context) {
+        let plat = platform::current();
+        plat.set_dock_icon(true);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        plat.activate();
+        self.hidden = false;
+    }
+
+    fn tray_action(&mut self, ctx: &egui::Context, action: TrayAction) {
+        let (active, paused) = {
+            let s = self.ctl.session();
+            (s.active(), s.state == RunState::Paused)
+        };
+        match action {
+            TrayAction::RunOnce | TrayAction::RunContinuously => {
+                self.ctl.mode = if action == TrayAction::RunOnce {
+                    RunMode::OneShot
+                } else {
+                    RunMode::Continuous
+                };
+                self.view = TimeView::default();
+                self.ctl.start();
+            }
+            TrayAction::PauseResume if paused => self.ctl.resume(),
+            TrayAction::PauseResume if active => self.ctl.pause(),
+            TrayAction::PauseResume => {}
+            TrayAction::Stop => self.ctl.stop(),
+            TrayAction::ShowWindow => self.show_window(ctx),
+            TrayAction::Quit => platform::current().quit(),
+        }
+    }
+
+    /// Refresh the menu bar item. Returns whether a run is active.
+    fn update_tray(&mut self) -> bool {
+        let status = {
+            let s = self.ctl.session();
+            self.cache.update(&s);
+            let d = &self.cache.derived;
+            let v = |x: Option<f64>, f: fn(f64) -> String, unit: &str| {
+                x.map_or_else(|| "—".to_owned(), |x| format!("{} {unit}", f(x)))
+            };
+            let latency = d.latency.value.map(|x| format!("{} ms", format::ms(x)));
+            TrayStatus {
+                title: latency.unwrap_or_default(),
+                rows: vec![
+                    ("Download".into(), v(d.download.value, format::mbps, "Mbps")),
+                    ("Upload".into(), v(d.upload.value, format::mbps, "Mbps")),
+                    ("Latency".into(), v(d.latency.value, format::ms, "ms")),
+                    ("Jitter".into(), v(d.jitter.value, format::ms, "ms")),
+                    ("Packet loss".into(), v(d.loss.value, format::pct, "%")),
+                ],
+                status: controls::status(&s, None).0,
+                one_shot_running: s.active() && s.mode == Some(RunMode::OneShot),
+                continuous_running: s.active() && s.mode == Some(RunMode::Continuous),
+                paused: s.state == RunState::Paused,
+            }
+        };
+        let active = status.one_shot_running || status.continuous_running;
+        platform::current().tray_update(&status);
+        active
+    }
+
     fn note(&mut self, msg: String, err: bool) {
         self.notice = Some((msg, err, Instant::now()));
     }
@@ -158,6 +238,32 @@ impl eframe::App for SpeedApp {
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         theme::BG.to_normalized_gamma_f32()
+    }
+
+    /// Runs before every frame, and alone while the window is closed and
+    /// the app lives in the menu bar.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let plat = platform::current();
+        for action in plat.tray_take_actions() {
+            self.tray_action(ctx, action);
+        }
+        if self.menu_bar && ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            plat.set_dock_icon(false);
+            self.hidden = true;
+        } else if self.hidden && ctx.input(|i| i.viewport().visible()) == Some(true) {
+            // Activating the app from the status item can order the window
+            // back in; it stays hidden until `Show window`.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+        if self.menu_bar {
+            let active = self.update_tray();
+            if active && self.hidden {
+                // Status and countdown keep ticking with no window.
+                ctx.request_repaint_after(Duration::from_secs(1));
+            }
+        }
     }
 }
 
@@ -183,6 +289,7 @@ impl SpeedApp {
                 settings_open,
                 notice,
                 log_tab,
+                menu_bar,
                 ..
             } = self;
             let s = ctl.session();
@@ -254,10 +361,17 @@ impl SpeedApp {
                             charts.overview(ui, Rect::from_min_size(r.min, r.size()), &inp, view);
                             let notice = notice.as_ref().map(|(m, e, _)| (m.as_str(), *e));
                             controls::show(ui, text, &s, ctl.mode, notice, &mut actions);
-                            if *settings_open
-                                && let Some(cfg) = controls::settings(ui, text, &ctl.config, d)
-                            {
-                                actions.push(Action::Config(cfg));
+                            if *settings_open {
+                                let menu_bar =
+                                    platform::current().tray_supported().then_some(*menu_bar);
+                                let (cfg, bar) =
+                                    controls::settings(ui, text, &ctl.config, d, menu_bar);
+                                if let Some(cfg) = cfg {
+                                    actions.push(Action::Config(cfg));
+                                }
+                                if let Some(on) = bar {
+                                    actions.push(Action::MenuBar(on));
+                                }
                             }
                             breakdown::show(ui, text, &s, d, boxes);
                             widgets::frame().show(ui, |ui| {
@@ -290,6 +404,7 @@ impl SpeedApp {
                     }
                 }
                 Action::ToggleSettings => self.settings_open = !self.settings_open,
+                Action::MenuBar(on) => self.set_menu_bar(ui.ctx(), on),
             }
         }
     }

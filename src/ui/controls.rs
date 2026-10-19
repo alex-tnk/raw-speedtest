@@ -22,10 +22,12 @@ pub enum Action {
     Mode(RunMode),
     Config(Config),
     ToggleSettings,
+    /// Keep the app in the menu bar (and running) when the window closes.
+    MenuBar(bool),
 }
 
 /// Status line text and color.
-fn status(s: &Session, notice: Option<(&str, bool)>) -> (String, Color32) {
+pub(super) fn status(s: &Session, notice: Option<(&str, bool)>) -> (String, Color32) {
     let now = s.now().unwrap_or(0.0);
     if let Some((msg, err)) = notice {
         return (msg.to_owned(), if err { theme::ERROR } else { theme::TEXT });
@@ -220,8 +222,16 @@ const LOSS_HZ: [(f64, &str); 6] = [
 ];
 const FAMILIES: [IpFamily; 3] = [IpFamily::Auto, IpFamily::V4, IpFamily::V6];
 
-/// Continuous-mode load and IP version. Returns a changed config.
-pub fn settings(ui: &mut Ui, text: &Text, cfg: &Config, d: &Derived) -> Option<Config> {
+/// Continuous-mode load, IP version and, where supported, the menu bar
+/// switch. Returns a changed config and a changed menu bar setting.
+pub fn settings(
+    ui: &mut Ui,
+    text: &Text,
+    cfg: &Config,
+    d: &Derived,
+    menu_bar: Option<bool>,
+) -> (Option<Config>, Option<bool>) {
+    let mut menu_bar_change = None;
     let mut out = *cfg;
     let mut changed = false;
     let mut family = out.family;
@@ -269,6 +279,11 @@ pub fn settings(ui: &mut Ui, text: &Text, cfg: &Config, d: &Derived) -> Option<C
             family = FAMILIES[i];
             changed = true;
         }
+        if let Some(on) = menu_bar
+            && let Some(i) = widgets::option_row(ui, text, "Run in menu bar", &["Off", "On"], usize::from(on))
+        {
+            menu_bar_change = Some(i == 1);
+        }
         // Throughput data per hour at these settings.
         let size = |rate: Option<f64>| match c.payload {
             Payload::Bytes(b) => Some(b as f64),
@@ -301,5 +316,5 @@ pub fn settings(ui: &mut Ui, text: &Text, cfg: &Config, d: &Derived) -> Option<C
         }
     });
     out.family = family;
-    changed.then_some(out)
+    (changed.then_some(out), menu_bar_change)
 }

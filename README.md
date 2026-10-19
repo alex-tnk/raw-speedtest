@@ -6,6 +6,10 @@ throughput in 50 ms bins, every latency probe, every UDP probe, per-request
 DNS/TCP/TLS/TTFB timing, TCP retransmissions, gateway latency and Wi-Fi
 signal. It runs once, or continuously for days with bounded memory.
 
+On macOS it can also live in the menu bar (Settings → Run in menu bar):
+closing the window keeps the test running, and the menu bar shows live
+latency with a menu of the current values and run controls.
+
 The app writes nothing to disk. Data leaves it only through Export, to a
 file you choose.
 

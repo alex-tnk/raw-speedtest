@@ -11,6 +11,7 @@ use objc2_app_kit::{NSApplication, NSModalResponseOK, NSSavePanel};
 use objc2_core_wlan::{CWInterface, CWWiFiClient};
 use objc2_foundation::{NSBundle, NSDictionary, NSNumber, NSProcessInfo, NSString, NSUserDefaults};
 
+use super::macos_tray;
 use super::unix::{self, kind_from_name};
 use super::{PingError, Platform, UiFont};
 use crate::model::{InterfaceInfo, TcpStats, WifiInfo};
@@ -533,6 +534,34 @@ impl Platform for MacOs {
             // Re-set so AppKit re-reads which delegate methods exist.
             app.setDelegate(Some(&delegate));
         }
+    }
+
+    fn tray_supported(&self) -> bool {
+        true
+    }
+
+    fn tray_set(&self, on: bool, wake: super::Wake) {
+        macos_tray::set(on, wake);
+    }
+
+    fn tray_update(&self, status: &super::TrayStatus) {
+        macos_tray::update(status);
+    }
+
+    fn tray_take_actions(&self) -> Vec<super::TrayAction> {
+        macos_tray::take_actions()
+    }
+
+    fn set_dock_icon(&self, visible: bool) {
+        macos_tray::set_dock_icon(visible);
+    }
+
+    fn activate(&self) {
+        macos_tray::activate();
+    }
+
+    fn quit(&self) {
+        macos_tray::quit();
     }
 
     fn choose_save_path(&self, suggested_name: &str) -> Result<Option<PathBuf>, String> {

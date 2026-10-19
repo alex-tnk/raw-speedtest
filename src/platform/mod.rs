@@ -4,6 +4,7 @@
 
 use std::net::{IpAddr, TcpStream};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::model::{InterfaceInfo, TcpStats, WifiInfo};
@@ -12,6 +13,8 @@ use crate::model::{InterfaceInfo, TcpStats, WifiInfo};
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "macos")]
+mod macos_tray;
 #[cfg(unix)]
 mod unix;
 #[cfg(target_os = "windows")]
@@ -38,6 +41,38 @@ pub enum PingError {
     Failed(String),
 }
 
+/// What the menu bar item shows. The UI formats it; the platform only
+/// displays it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TrayStatus {
+    /// Compact value next to the icon (latency); empty shows the icon only.
+    pub title: String,
+    /// `(label, value)` rows: download, upload, latency, jitter, loss.
+    pub rows: Vec<(String, String)>,
+    /// The status line, as in the window.
+    pub status: String,
+    pub one_shot_running: bool,
+    pub continuous_running: bool,
+    pub paused: bool,
+}
+
+/// A command picked from the menu bar item.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// Only the macOS menu bar item creates these; elsewhere the UI's handling of
+// them is never reached.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub enum TrayAction {
+    RunOnce,
+    RunContinuously,
+    PauseResume,
+    Stop,
+    ShowWindow,
+    Quit,
+}
+
+/// Asks the UI loop to run soon (to act on a menu bar pick).
+pub type Wake = Arc<dyn Fn() + Send + Sync>;
+
 pub trait Platform: Send + Sync {
     /// Kernel TCP counters for a connected socket.
     fn tcp_stats(&self, sock: &TcpStream) -> Option<TcpStats>;
@@ -63,6 +98,33 @@ pub trait Platform: Send + Sync {
 
     /// Called once the main window exists.
     fn window_created(&self) {}
+
+    /// Whether the app can live in a menu bar (or tray) item.
+    fn tray_supported(&self) -> bool {
+        false
+    }
+
+    /// Show or remove the menu bar item. Main thread.
+    fn tray_set(&self, _on: bool, _wake: Wake) {}
+
+    /// Refresh what the menu bar item shows. Main thread.
+    fn tray_update(&self, _status: &TrayStatus) {}
+
+    /// Menu bar picks since the last call.
+    fn tray_take_actions(&self) -> Vec<TrayAction> {
+        Vec::new()
+    }
+
+    /// Show or hide the Dock icon, for running with the window closed.
+    fn set_dock_icon(&self, _visible: bool) {}
+
+    /// Bring the app to the front.
+    fn activate(&self) {}
+
+    /// Quit through the platform's normal path so exit cleanup runs.
+    fn quit(&self) {
+        std::process::exit(0);
+    }
 
     /// Ask the user where to save an export. Blocks until answered.
     fn choose_save_path(&self, suggested_name: &str) -> Result<Option<PathBuf>, String>;
