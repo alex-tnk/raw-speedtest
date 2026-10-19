@@ -1,0 +1,18 @@
+[package]
+name = "raw-speed-test"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Fine-grained internet speed test against Cloudflare's public endpoints"
+publish = false
+
+[[bin]]
+name = "raw-speed-test"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
