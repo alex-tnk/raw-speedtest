@@ -6,6 +6,7 @@
 #![allow(dead_code, unused_imports)]
 
 mod model;
+mod net;
 mod stats;
 
 fn main() {}

@@ -10,9 +10,24 @@ publish = false
 name = "raw-speed-test"
 path = "src/main.rs"
 
+[dependencies]
+# TLS for the hand-rolled HTTP/1.1 client, which needs per-phase timing that
+# no high-level HTTP crate exposes. `ring` is the smallest crypto provider.
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+] }
+# Mozilla root certificates compiled into the binary: no keychain or file
+# access needed to verify speed.cloudflare.com.
+webpki-roots = "1"
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
 panic = "abort"
+
+[profile.dev.package."*"]
+# Dependencies (rustls) are painfully slow unoptimized.
+opt-level = 2
