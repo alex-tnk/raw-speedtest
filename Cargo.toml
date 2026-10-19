@@ -11,6 +11,16 @@ name = "raw-speed-test"
 path = "src/main.rs"
 
 [dependencies]
+# UI: immediate-mode egui, GPU-rendered through OpenGL (glow). Chosen over
+# the wgpu/Metal renderer because Metal writes a per-app shader cache to
+# disk; see CLAUDE.md. No default fonts (the system UI font is loaded at
+# runtime) and no persistence (it would write window state to disk).
+eframe = { version = "0.37", default-features = false, features = [
+    "glow",
+    "accesskit",
+    "x11",
+    "wayland",
+] }
 # TLS for the hand-rolled HTTP/1.1 client, which needs per-phase timing that
 # no high-level HTTP crate exposes. `ring` is the smallest crypto provider.
 rustls = { version = "0.23", default-features = false, features = [
@@ -73,5 +83,5 @@ strip = true
 panic = "abort"
 
 [profile.dev.package."*"]
-# Dependencies (rustls) are painfully slow unoptimized.
+# Dependencies (egui, rustls) are painfully slow unoptimized.
 opt-level = 2
