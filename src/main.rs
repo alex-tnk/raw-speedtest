@@ -5,6 +5,7 @@
 // does, so until then their items and re-exports count as unused.
 #![allow(dead_code, unused_imports)]
 
+mod app;
 mod engine;
 mod model;
 mod net;
