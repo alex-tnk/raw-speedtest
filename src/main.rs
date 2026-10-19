@@ -7,6 +7,7 @@
 
 mod model;
 mod net;
+mod platform;
 mod stats;
 
 fn main() {}

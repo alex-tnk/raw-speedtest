@@ -21,6 +21,50 @@ rustls = { version = "0.23", default-features = false, features = [
 # Mozilla root certificates compiled into the binary: no keychain or file
 # access needed to verify speed.cloudflare.com.
 webpki-roots = "1"
+# Raw socket options (TCP_INFO, ICMP, getifaddrs, routing sysctl).
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Objective-C runtime bindings: the CLAUDE.md-mandated way to reach AppKit
+# and CoreWLAN. Already in the tree through winit; features kept minimal.
+objc2 = "0.6"
+# Strings, dictionaries, NSUserDefaults registration domain, bundle info.
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSString",
+    "NSArray",
+    "NSURL",
+    "NSValue",
+    "NSDictionary",
+    "NSUserDefaults",
+    "NSObject",
+    "NSSet",
+    "NSData",
+    "NSEnumerator",
+    "NSBundle",
+    "NSProcessInfo",
+] }
+# Save panel for Export and window restoration switches.
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSApplication",
+    "NSResponder",
+    "NSWindow",
+    "NSSavePanel",
+    "NSPanel",
+    "NSView",
+    "NSRunningApplication",
+    "NSWindowRestoration",
+] }
+# Wi-Fi metrics (RSSI, noise, channel, PHY mode, transmit rate).
+objc2-core-wlan = { version = "0.3", default-features = false, features = [
+    "std",
+    "CWWiFiClient",
+    "CWInterface",
+    "CWChannel",
+    "CoreWLANTypes",
+] }
+
 [profile.release]
 opt-level = 3
 lto = true
