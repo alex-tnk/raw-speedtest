@@ -147,8 +147,32 @@ fn bytes(s: &str, out: *mut RstBytes) {
     }
 }
 
+/// Chart kinds and box plot indices, as `include/rst.h` numbers them.
 fn chart_id(kind: u32, index: u32) -> Option<ChartId> {
-    ChartId::from_raw(u8::try_from(kind).ok()?, u8::try_from(index).ok()?)
+    Some(match kind {
+        0 => ChartId::Throughput,
+        1 => ChartId::Latency,
+        2 => ChartId::Overview,
+        3 => ChartId::Box(match index {
+            0 => BoxId::Download,
+            1 => BoxId::Upload,
+            2 => BoxId::Latency,
+            3 => BoxId::Gateway,
+            4 => BoxId::Udp,
+            _ => return None,
+        }),
+        4 => ChartId::Rssi,
+        _ => return None,
+    })
+}
+
+fn log_tab(v: u32) -> Option<Tab> {
+    match v {
+        0 => Some(Tab::Requests),
+        1 => Some(Tab::Connections),
+        2 => Some(Tab::Errors),
+        _ => None,
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -422,7 +446,7 @@ pub extern "C" fn rst_log(ptr: *mut RstCore, tab: u32, first: u32, count: u32, o
     let Some(c) = (unsafe { core(ptr) }) else {
         return;
     };
-    let Some(tab) = u8::try_from(tab).ok().and_then(Tab::from_u8) else {
+    let Some(tab) = log_tab(tab) else {
         return;
     };
     let total = c.core.log_len(tab);

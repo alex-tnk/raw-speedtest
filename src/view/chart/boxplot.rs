@@ -28,6 +28,7 @@ pub enum BoxId {
 }
 
 impl BoxId {
+    #[cfg(test)]
     pub const ALL: [BoxId; 5] = [
         BoxId::Download,
         BoxId::Upload,
@@ -35,10 +36,6 @@ impl BoxId {
         BoxId::Gateway,
         BoxId::Udp,
     ];
-
-    pub fn from_u8(v: u8) -> Option<BoxId> {
-        BoxId::ALL.get(usize::from(v)).copied()
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -164,6 +161,8 @@ pub fn data_key(id: BoxId, s: &Session) -> [u64; 2] {
 }
 
 /// Height for `rows` rows plus the axis.
+// Not every shell uses every part of the view layer.
+#[allow(dead_code)]
 pub fn height(rows: usize) -> f32 {
     rows.max(1) as f32 * palette::BOX_ROW + palette::AXIS_HEIGHT
 }

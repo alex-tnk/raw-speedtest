@@ -29,6 +29,8 @@ impl Tip {
     pub fn push_pair(&mut self, k: impl Into<String>, v: impl Into<String>) {
         self.rows.push(TipRow::Pair(k.into(), v.into()));
     }
+    // Not every shell uses every part of the view layer.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }

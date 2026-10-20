@@ -47,6 +47,8 @@ impl Color {
     }
 
     /// Every token, in `repr` order.
+    // Not every shell uses every part of the view layer.
+    #[allow(dead_code)]
     pub const ALL: [Color; 13] = [
         Color::Download,
         Color::Upload,
@@ -84,7 +86,6 @@ pub const PERCENTILE_ALPHA: f32 = 0.7;
 // Chart geometry, in points.
 pub const S4: f32 = 4.0;
 pub const S8: f32 = 8.0;
-pub const S12: f32 = 12.0;
 pub const S16: f32 = 16.0;
 pub const STROKE: f32 = 1.0;
 pub const DATA_LINE: f32 = 1.5;
@@ -102,7 +103,7 @@ pub const DOT_MIN_SPACING: f32 = 6.0;
 /// Value axis labels left of a time-series plot.
 pub const AXIS_WIDTH: f32 = 44.0;
 /// Space right of a time-series plot for percentile labels.
-pub const RIGHT_GUTTER: f32 = 72.0;
+pub const RIGHT_GUTTER: f32 = 84.0;
 /// Time axis labels below a plot.
 pub const AXIS_HEIGHT: f32 = 20.0;
 /// Space above a time-series plot for the unit label.

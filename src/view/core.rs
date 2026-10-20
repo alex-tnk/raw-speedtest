@@ -34,20 +34,6 @@ pub enum ChartId {
     Rssi,
 }
 
-impl ChartId {
-    /// From the FFI encoding: kind, plus the box plot for kind 3.
-    pub fn from_raw(kind: u8, index: u8) -> Option<ChartId> {
-        Some(match kind {
-            0 => ChartId::Throughput,
-            1 => ChartId::Latency,
-            2 => ChartId::Overview,
-            3 => ChartId::Box(BoxId::from_u8(index)?),
-            4 => ChartId::Rssi,
-            _ => return None,
-        })
-    }
-}
-
 type ExportResult = Result<PathBuf, String>;
 
 /// What a cached scene was built from.
@@ -272,6 +258,8 @@ impl Core {
 
     /// Bumped each time the scene of `id` is rebuilt, so a shell can keep
     /// its own drawing objects until then. 0 before the first build.
+    // Not every shell uses every part of the view layer.
+    #[allow(dead_code)]
     pub fn scene_generation(&self, id: ChartId) -> u64 {
         self.scenes.get(&id).map_or(0, |e| e.2)
     }
@@ -336,14 +324,6 @@ impl Core {
         self.view = TimeView::default();
     }
 
-    pub fn zoomed(&self) -> bool {
-        self.view.span.is_some()
-    }
-
-    pub fn mode(&self) -> RunMode {
-        self.ctl.mode
-    }
-
     /// Takes effect for the next run.
     pub fn set_mode(&mut self, mode: RunMode) {
         if !self.ctl.session().active() {
@@ -351,6 +331,8 @@ impl Core {
         }
     }
 
+    // Not every shell uses every part of the view layer.
+    #[allow(dead_code)]
     pub fn config(&self) -> Config {
         self.ctl.config
     }
@@ -372,6 +354,8 @@ impl Core {
     }
 
     /// Start a run in `mode`, restarting one that is active.
+    // Not every shell uses every part of the view layer.
+    #[allow(dead_code)]
     pub fn start_mode(&mut self, mode: RunMode) {
         self.ctl.mode = mode;
         self.start();
@@ -394,10 +378,14 @@ impl Core {
         self.ctl.reset();
     }
 
+    // Not every shell uses every part of the view layer.
+    #[allow(dead_code)]
     pub fn log_len(&self, tab: Tab) -> usize {
         log::len(&self.ctl.session(), tab)
     }
 
+    // Not every shell uses every part of the view layer.
+    #[allow(dead_code)]
     pub fn log_rows(&self, tab: Tab, first: usize, count: usize) -> Vec<log::Row> {
         log::rows(&self.ctl.session(), tab, first, count)
     }
@@ -427,6 +415,8 @@ impl Core {
     }
 
     /// Run `f` with the session (tests, and shells' own summaries).
+    // Not every shell uses every part of the view layer.
+    #[allow(dead_code)]
     pub fn with_session<T>(&self, f: impl FnOnce(&Session) -> T) -> T {
         f(&self.ctl.session())
     }

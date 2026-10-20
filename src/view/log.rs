@@ -18,12 +18,6 @@ pub enum Tab {
 }
 
 impl Tab {
-    pub fn from_u8(v: u8) -> Option<Tab> {
-        [Tab::Requests, Tab::Connections, Tab::Errors]
-            .get(usize::from(v))
-            .copied()
-    }
-
     /// Tab label with its row count: `Requests 1,204`.
     pub fn label(self, n: usize) -> String {
         let name = match self {

@@ -8,6 +8,8 @@ use crate::view::scene::{HAlign, Point, Rect, Scene, TextSize, VAlign, pt};
 use crate::view::tip::Tip;
 
 /// Height of the sparkline.
+// Not every shell uses every part of the view layer.
+#[allow(dead_code)]
 pub const HEIGHT: f32 = palette::S16 * 3.0;
 
 /// Whether there is enough to draw.

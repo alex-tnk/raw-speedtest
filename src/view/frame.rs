@@ -172,6 +172,8 @@ impl Setting {
         Setting::IpVersion,
     ];
 
+    // Not every shell uses every part of the view layer.
+    #[allow(dead_code)]
     pub fn from_u8(v: u8) -> Option<Setting> {
         Setting::ALL.get(usize::from(v)).copied()
     }

@@ -335,6 +335,8 @@ impl Scene {
     }
 
     /// The text of a `Prim::Text`.
+    // Not every shell uses every part of the view layer.
+    #[allow(dead_code)]
     pub fn str(&self, range: &Range<u32>) -> &str {
         &self.text[range.start as usize..range.end as usize]
     }
