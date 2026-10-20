@@ -128,6 +128,7 @@ mod imp {
                 // The session moved on under the model (a new run, or the
                 // ring dropped these rows); the next sync catches up.
                 let empty = Row {
+                    id: 0,
                     cells: Vec::new(),
                     tip: None,
                 };
