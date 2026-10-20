@@ -64,6 +64,8 @@ pub struct Derived {
     pub loss: Headline,
     pub loss_basis: LossCounts,
     pub sizes: [Vec<SizeGroup>; 2],
+    /// Median time to first byte per direction, over every request.
+    pub ttfb_median: [Option<f64>; 2],
     pub lat_by_load: [Stat; 3],
     pub jitter_by_load: [Option<f64>; 3],
     pub gw_by_load: [Stat; 3],
@@ -160,6 +162,14 @@ fn compute(s: &Session, scratch: &mut Vec<f64>) -> Derived {
                 incomplete,
             })
             .collect();
+
+        d.ttfb_median[dir_idx(dir)] = summarize_iter(
+            scratch,
+            s.requests_in(dir)
+                .map(|r| r.ttfb_ms)
+                .filter(|v| v.is_finite()),
+        )
+        .map(|t| t.median);
 
         let usable =
             |r: &&crate::model::RequestRecord| r.duration_ms >= MIN_REQUEST_MS && r.bps.is_some();

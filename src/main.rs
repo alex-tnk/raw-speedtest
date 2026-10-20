@@ -9,6 +9,10 @@ mod platform;
 mod shell;
 mod stats;
 mod ui;
+// The native shells adopt the view layer one by one; until each does, the
+// parts it would use count as unused.
+#[allow(dead_code)]
+mod view;
 
 fn main() {
     platform::current().prepare_process();

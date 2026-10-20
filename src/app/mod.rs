@@ -54,6 +54,11 @@ impl Controller {
         self.session.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// The session, for work done off the UI thread (export).
+    pub fn shared(&self) -> Arc<Mutex<Session>> {
+        self.session.clone()
+    }
+
     pub fn start(&self) {
         self.engine.send(Command::Start(self.mode, self.config));
     }
