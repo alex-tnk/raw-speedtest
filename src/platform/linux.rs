@@ -196,6 +196,16 @@ impl Platform for Linux {
     }
 
     fn prepare_process(&self) {
+        // GPU drivers keep compiled shaders in the user cache directory:
+        // Mesa (OpenGL and Vulkan) in mesa_shader_cache, NVIDIA in
+        // nvidia/GLCache. GTK renders with them, so turn both caches off.
+        for (k, v) in [
+            ("MESA_SHADER_CACHE_DISABLE", "true"),
+            ("__GL_SHADER_DISK_CACHE", "0"),
+        ] {
+            // SAFETY: called first thing in main, before any thread exists.
+            unsafe { std::env::set_var(k, v) };
+        }
         unix::exit_on_termination_signals();
     }
 

@@ -93,6 +93,19 @@ objc2-core-wlan = { version = "0.3", default-features = false, features = [
     "CoreWLANTypes",
 ] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Native Linux shell: GTK 4 widgets, Cairo for the chart scenes, the
+# portal-backed save dialog. v4_12 for GtkFileDialog and the list-model
+# APIs the log tables use; minimum runtime GTK 4.12 (Ubuntu 24.04).
+gtk = { package = "gtk4", version = "0.11", features = ["v4_12"] }
+# GNOME's window chrome and patterns on top of GTK: header bar, toolbar
+# view, overlay split view, preferences dialog, system light/dark style.
+# v1_5 for AdwPreferencesDialog; minimum runtime libadwaita 1.5.
+adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
+# Chart text: lays out scene labels with Pango and draws them into the
+# same Cairo context as the shapes. Already in every GTK install.
+pangocairo = "0.22"
+
 [profile.release]
 opt-level = 3
 lto = true
