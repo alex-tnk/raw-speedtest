@@ -21,8 +21,9 @@ use crate::model::{Config, RunMode};
 
 /// How long an export notice stays in the status line.
 const NOTICE: Duration = Duration::from_secs(8);
-/// Elapsed time and countdowns tick this often while a run is active.
-const TICK: Duration = Duration::from_millis(500);
+/// Elapsed time and countdowns (whole seconds) tick this often while a
+/// run is active.
+const TICK: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ChartId {
@@ -52,9 +53,89 @@ type ExportResult = Result<PathBuf, String>;
 /// What a cached scene was built from.
 #[derive(Clone, Copy, PartialEq)]
 struct Key {
+    /// Changes when the data the chart draws changes.
     data: u64,
     size: [u32; 3],
-    range: [u64; 2],
+    /// The time window's settings (span, end).
+    view: [u64; 2],
+    /// The time range drawn, which creeps with the clock while following.
+    range: (f64, f64),
+}
+
+impl Key {
+    const NONE: Key = Key {
+        data: u64::MAX,
+        size: [0; 3],
+        view: [0; 2],
+        range: (f64::NAN, f64::NAN),
+    };
+
+    /// Whether a scene built for `self` must be rebuilt for `new`. The
+    /// time range may creep by less than a point (`secs_per_pt`) before it
+    /// shows, so a chart following live data isn't redrawn for nothing.
+    fn stale(&self, new: &Key, secs_per_pt: f64) -> bool {
+        self.data != new.data
+            || self.size != new.size
+            || self.view != new.view
+            || !((self.range.0 - new.range.0).abs() < secs_per_pt
+                && (self.range.1 - new.range.1).abs() < secs_per_pt)
+    }
+}
+
+/// Mixes counters into one key.
+fn mix(parts: &[u64]) -> u64 {
+    parts.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, p| {
+        (h ^ p).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// Distinguishes runs, so a reset or a new run always rebuilds.
+fn run_id(s: &Session) -> u64 {
+    s.wall_start
+        .and_then(|w| w.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos() as u64)
+}
+
+/// What each chart draws, as a key that changes only when that data does.
+fn data_key(id: ChartId, s: &Session, run_end: f64) -> u64 {
+    let ring = |len: usize, evicted: u64| [len as u64, evicted];
+    match id {
+        ChartId::Throughput => {
+            let [a, b] = ring(s.throughput[0].raw.len(), s.throughput[0].raw.evicted());
+            let [c, d] = ring(s.throughput[1].raw.len(), s.throughput[1].raw.evicted());
+            let [e, f] = ring(s.requests.len(), s.requests.evicted());
+            mix(&[a, b, c, d, e, f, run_id(s)])
+        }
+        ChartId::Latency => {
+            let paused = series::Charts::latency_ticks_with_clock(s);
+            mix(&[
+                s.latency.raw.len() as u64,
+                s.latency.raw.evicted(),
+                s.gateway.raw.len() as u64,
+                s.gateway.raw.evicted(),
+                s.loss.raw.len() as u64,
+                s.loss.raw.evicted(),
+                s.requests.len() as u64,
+                s.pauses.len() as u64,
+                s.config.continuous.latency_interval.as_millis() as u64,
+                // An ongoing pause band grows with the clock, not the data.
+                if paused { run_end as u64 } else { u64::MAX },
+                run_id(s),
+            ])
+        }
+        // Rebuilt at most once per second of run time or 64 changes.
+        ChartId::Overview => mix(&[s.version / 64, run_end as u64, s.state as u64]),
+        // A box plot changes only when its own samples do.
+        ChartId::Box(b) => {
+            let [n, evicted] = boxplot::data_key(b, s);
+            mix(&[n, evicted, run_id(s)])
+        }
+        ChartId::Rssi => mix(&[
+            s.wifi_samples.raw.len() as u64,
+            s.wifi_samples.raw.evicted(),
+            run_id(s),
+        ]),
+    }
 }
 
 pub struct Core {
@@ -65,7 +146,9 @@ pub struct Core {
     notice: Option<(String, bool, Instant)>,
     exports: (Sender<ExportResult>, Receiver<ExportResult>),
     charts: Charts,
-    scenes: HashMap<ChartId, (Key, Scene)>,
+    /// Per chart: what the scene was built from, the scene, and a counter
+    /// bumped on every rebuild.
+    scenes: HashMap<ChartId, (Key, Scene, u64)>,
     bits: Vec<u64>,
     pts: Vec<Point>,
     breaks: Vec<usize>,
@@ -144,37 +227,27 @@ impl Core {
         let s = ctl.session();
         let run_end = s.now().unwrap_or(1.0);
         let (t0, t1) = view.range(run_end);
+        let time = matches!(id, ChartId::Throughput | ChartId::Latency);
         let key = Key {
-            data: match id {
-                // An ongoing pause band grows with the clock, not the data.
-                ChartId::Latency if series::Charts::latency_ticks_with_clock(&s) => {
-                    s.version ^ (run_end as u64).rotate_left(32)
-                }
-                // Rebuilt at most once per second of run time or 64 changes.
-                ChartId::Overview => (s.version / 64) ^ (run_end as u64).rotate_left(32),
-                _ => s.version,
-            },
+            data: data_key(id, &s, run_end),
             size: [w.to_bits(), h.to_bits(), label_h.to_bits()],
-            range: match id {
-                ChartId::Throughput | ChartId::Latency => [t0.to_bits(), t1.to_bits()],
-                ChartId::Overview => [
+            view: match id {
+                ChartId::Throughput | ChartId::Latency | ChartId::Overview => [
                     view.span.unwrap_or(-1.0).to_bits(),
                     view.end.unwrap_or(-1.0).to_bits(),
                 ],
                 _ => [0, 0],
             },
+            range: if time { (t0, t1) } else { (0.0, 0.0) },
         };
-        let entry = scenes.entry(id).or_insert_with(|| {
-            (
-                Key {
-                    data: u64::MAX,
-                    size: [0; 3],
-                    range: [0; 2],
-                },
-                Scene::default(),
-            )
-        });
-        if entry.0 != key {
+        let secs_per_pt = (t1 - t0) / f64::from(time_plot(w, h).width().max(1.0));
+        let entry = scenes
+            .entry(id)
+            .or_insert_with(|| (Key::NONE, Scene::default(), 0));
+        if entry
+            .0
+            .stale(&key, if time { secs_per_pt } else { f64::INFINITY })
+        {
             let inp = Inputs {
                 s: &s,
                 wall0: s.wall_start.unwrap_or(SystemTime::UNIX_EPOCH),
@@ -192,8 +265,15 @@ impl Core {
                 ChartId::Rssi => rssi::scene(&s, w, h, sc, pts, breaks),
             }
             entry.0 = key;
+            entry.2 += 1;
         }
         &entry.1
+    }
+
+    /// Bumped each time the scene of `id` is rebuilt, so a shell can keep
+    /// its own drawing objects until then. 0 before the first build.
+    pub fn scene_generation(&self, id: ChartId) -> u64 {
+        self.scenes.get(&id).map_or(0, |e| e.2)
     }
 
     /// What hovering chart `id` at chart-local `(x, y)` shows.
@@ -486,6 +566,26 @@ mod tests {
             .pts
             .len();
         assert!(n1 >= n2);
+    }
+
+    #[test]
+    fn export_writes_off_thread_and_reports_in_the_status() {
+        let mut core = core_with(60.0);
+        let path =
+            std::env::temp_dir().join(format!("rst-export-test-{}.json", std::process::id()));
+        core.export(path.clone());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            let f = core.frame();
+            if f.status.text.starts_with("Export") || Instant::now() > deadline {
+                break f.status.text;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let written = std::fs::read_to_string(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(status.starts_with("Exported to"), "{status}");
+        assert!(written.is_ok_and(|j| crate::net::json::Json::parse(&j).is_some()));
     }
 
     #[test]

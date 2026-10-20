@@ -152,6 +152,17 @@ pub fn shown(id: BoxId, d: &Derived) -> bool {
     }
 }
 
+/// Changes whenever the samples behind box plot `id` are added or evicted.
+pub fn data_key(id: BoxId, s: &Session) -> [u64; 2] {
+    let (n, evicted) = match id {
+        BoxId::Download | BoxId::Upload => (s.requests.len(), s.requests.evicted()),
+        BoxId::Latency => (s.latency.raw.len(), s.latency.raw.evicted()),
+        BoxId::Gateway => (s.gateway.raw.len(), s.gateway.raw.evicted()),
+        BoxId::Udp => (s.loss.raw.len(), s.loss.raw.evicted()),
+    };
+    [n as u64, evicted]
+}
+
 /// Height for `rows` rows plus the axis.
 pub fn height(rows: usize) -> f32 {
     rows.max(1) as f32 * palette::BOX_ROW + palette::AXIS_HEIGHT

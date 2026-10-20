@@ -7,7 +7,9 @@ use std::ops::Range;
 
 use super::palette::Color;
 
+/// `repr(C)`, so a scene's points cross an FFI boundary as float pairs.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C)]
 pub struct Point {
     pub x: f32,
     pub y: f32,

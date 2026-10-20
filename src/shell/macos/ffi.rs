@@ -1,11 +1,22 @@
-//! The C ABI the SwiftUI shell calls. Every function is called on the main
-//! thread except the callbacks Rust invokes. Returned buffers are borrowed
-//! and stay valid until the next call of the same function.
+//! The C ABI the SwiftUI shell calls, declared in `include/rst.h`. Every
+//! function runs on the main thread; only the wake and quit callbacks are
+//! invoked from other threads. Returned buffers are borrowed and stay valid
+//! until the next call of the same function (for scenes: of the same chart).
 
+use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use super::json;
+use crate::model::RunMode;
+use crate::view::chart::boxplot::BoxId;
+use crate::view::core::{ChartId, Core};
+use crate::view::frame::Setting;
+use crate::view::log::Tab;
+use crate::view::scene::Prim;
 
 type WakeFn = extern "C" fn(ctx: *mut c_void, delay_ms: u32);
 type QuitFn = extern "C" fn(ctx: *mut c_void);
@@ -30,134 +41,446 @@ impl Callback<QuitFn> {
     }
 }
 
+/// The shell's wake callback, coalesced: at most one wake is outstanding
+/// until the shell pulls a frame.
 #[derive(Default)]
-struct Shared {
-    wake: Mutex<Option<Callback<WakeFn>>>,
-    /// A wake is outstanding; cleared when the shell pulls data.
+struct Wake {
+    cb: Mutex<Option<Callback<WakeFn>>>,
     pending: AtomicBool,
-    points: Mutex<Vec<f32>>,
-    version: AtomicU64,
 }
 
-impl Shared {
-    fn wake(&self, delay_ms: u32) {
+impl Wake {
+    fn wake(&self, delay: Duration) {
         if self.pending.swap(true, Ordering::AcqRel) {
             return;
         }
-        let cb = *self.wake.lock().unwrap_or_else(|e| e.into_inner());
+        let cb = *self.cb.lock().unwrap_or_else(|e| e.into_inner());
         match cb {
-            Some(cb) => (cb.f)(cb.ctx, delay_ms),
+            Some(cb) => (cb.f)(cb.ctx, delay.as_millis().min(u128::from(u32::MAX)) as u32),
             None => self.pending.store(false, Ordering::Release),
         }
     }
 }
 
+/// One drawing command; see `include/rst.h`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RstCmd {
+    pub kind: u8,
+    pub color: u8,
+    pub flags: u8,
+    pub pad: u8,
+    pub alpha: f32,
+    pub a: f32,
+    pub start: u32,
+    pub end: u32,
+    pub x0: f32,
+    pub y0: f32,
+    pub x1: f32,
+    pub y1: f32,
+}
+
+#[repr(C)]
+pub struct RstScene {
+    pub cmds: *const RstCmd,
+    pub n_cmds: u32,
+    /// x, y pairs.
+    pub pts: *const f32,
+    pub n_pts: u32,
+    /// UTF-8, not NUL-terminated.
+    pub text: *const u8,
+    pub n_text: u32,
+    pub plot_x0: f32,
+    pub plot_y0: f32,
+    pub plot_x1: f32,
+    pub plot_y1: f32,
+    /// Changes whenever the scene was rebuilt.
+    pub generation: u64,
+}
+
+#[repr(C)]
+pub struct RstBytes {
+    pub ptr: *const u8,
+    pub len: usize,
+}
+
 pub struct RstCore {
-    shared: Arc<Shared>,
-    /// Main-thread copy handed to Swift.
-    snapshot: Vec<f32>,
+    core: Core,
+    wake: Arc<Wake>,
+    cmds: HashMap<ChartId, (u64, Vec<RstCmd>)>,
+    frame_json: String,
+    hover_json: String,
+    log_json: String,
+    fixed_json: String,
 }
 
 impl RstCore {
     pub fn new() -> RstCore {
-        let shared = Arc::new(Shared::default());
-        let feed = shared.clone();
-        std::thread::Builder::new()
-            .name("spike-feed".into())
-            .spawn(move || {
-                let n = 10_000usize;
-                let mut y = 0.5f32;
-                let mut seed = 0x2545_f491_4f6c_dd1du64;
-                let mut ys: std::collections::VecDeque<f32> = (0..n).map(|_| 0.5).collect();
-                loop {
-                    for _ in 0..40 {
-                        seed ^= seed << 13;
-                        seed ^= seed >> 7;
-                        seed ^= seed << 17;
-                        let r = (seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5;
-                        y = (y + r * 0.05).clamp(0.0, 1.0);
-                        ys.pop_front();
-                        ys.push_back(y);
-                    }
-                    {
-                        let mut p = feed.points.lock().unwrap_or_else(|e| e.into_inner());
-                        p.clear();
-                        for (i, v) in ys.iter().enumerate() {
-                            p.push(i as f32 / (n - 1) as f32);
-                            p.push(*v);
-                        }
-                    }
-                    feed.version.fetch_add(1, Ordering::AcqRel);
-                    feed.wake(0);
-                    std::thread::sleep(Duration::from_millis(33));
-                }
-            })
-            .expect("spawn spike feed");
+        let wake = Arc::new(Wake::default());
+        let w = wake.clone();
         RstCore {
-            shared,
-            snapshot: Vec::new(),
+            core: Core::new(Arc::new(move |d| w.wake(d))),
+            wake,
+            cmds: HashMap::new(),
+            frame_json: String::new(),
+            hover_json: String::new(),
+            log_json: String::new(),
+            fixed_json: String::new(),
         }
     }
 }
 
 /// # Safety
-/// `core` must come from `rst_ui_main`'s argument.
-unsafe fn core<'a>(core: *mut RstCore) -> Option<&'a mut RstCore> {
-    // SAFETY: per the function contract; main thread only.
-    unsafe { core.as_mut() }
+/// `ptr` must be the core passed to `rst_ui_main`; main thread only.
+unsafe fn core<'a>(ptr: *mut RstCore) -> Option<&'a mut RstCore> {
+    // SAFETY: per the function contract.
+    unsafe { ptr.as_mut() }
+}
+
+fn bytes(s: &str, out: *mut RstBytes) {
+    // SAFETY: Swift passes a pointer to a local RstBytes.
+    if let Some(out) = unsafe { out.as_mut() } {
+        *out = RstBytes {
+            ptr: s.as_ptr(),
+            len: s.len(),
+        };
+    }
+}
+
+fn chart_id(kind: u32, index: u32) -> Option<ChartId> {
+    ChartId::from_raw(u8::try_from(kind).ok()?, u8::try_from(index).ok()?)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn rst_set_wake(core_ptr: *mut RstCore, f: Option<WakeFn>, ctx: *mut c_void) {
+pub extern "C" fn rst_set_wake(ptr: *mut RstCore, f: Option<WakeFn>, ctx: *mut c_void) {
     // SAFETY: the pointer Swift received from `rst_ui_main`.
-    let Some(core) = (unsafe { core(core_ptr) }) else {
+    let Some(c) = (unsafe { core(ptr) }) else {
         return;
     };
-    *core.shared.wake.lock().unwrap_or_else(|e| e.into_inner()) = f.map(|f| Callback { f, ctx });
-    core.shared.pending.store(false, Ordering::Release);
+    *c.wake.cb.lock().unwrap_or_else(|e| e.into_inner()) = f.map(|f| Callback { f, ctx });
+    c.wake.pending.store(false, Ordering::Release);
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn rst_set_quit(_core: *mut RstCore, f: Option<QuitFn>, ctx: *mut c_void) {
+pub extern "C" fn rst_set_quit(_ptr: *mut RstCore, f: Option<QuitFn>, ctx: *mut c_void) {
     if let Some(f) = f {
         let cb = Callback { f, ctx };
         crate::platform::set_quit_hook(Box::new(move || cb.quit()));
     }
 }
 
-/// Clears whatever AppKit stored in the app's preferences (save panel
-/// folder, menu bar item visibility); the app keeps none.
 #[unsafe(no_mangle)]
-pub extern "C" fn rst_forget_preferences(_core: *mut RstCore) {
+pub extern "C" fn rst_forget_preferences(_ptr: *mut RstCore) {
     crate::platform::current().forget_preferences();
 }
 
-#[repr(C)]
-pub struct RstPoints {
-    pub xy: *const f32,
-    pub n: u32,
-    pub version: u64,
-}
-
+/// Data colours, log columns and chart constants, as JSON.
 #[unsafe(no_mangle)]
-pub extern "C" fn rst_spike_points(core_ptr: *mut RstCore, out: *mut RstPoints) {
+pub extern "C" fn rst_fixed(ptr: *mut RstCore, out: *mut RstBytes) {
     // SAFETY: the pointer Swift received from `rst_ui_main`.
-    let Some(core) = (unsafe { core(core_ptr) }) else {
+    let Some(c) = (unsafe { core(ptr) }) else {
         return;
     };
-    core.shared.pending.store(false, Ordering::Release);
-    {
-        let p = core.shared.points.lock().unwrap_or_else(|e| e.into_inner());
-        core.snapshot.clear();
-        core.snapshot.extend_from_slice(&p);
-    }
-    let pts = RstPoints {
-        xy: core.snapshot.as_ptr(),
-        n: (core.snapshot.len() / 2) as u32,
-        version: core.shared.version.load(Ordering::Acquire),
+    json::fixed(&mut c.fixed_json);
+    bytes(&c.fixed_json, out);
+}
+
+/// The frame as JSON. Clears the outstanding wake.
+#[unsafe(no_mangle)]
+pub extern "C" fn rst_frame(ptr: *mut RstCore, out: *mut RstBytes) {
+    // SAFETY: the pointer Swift received from `rst_ui_main`.
+    let Some(c) = (unsafe { core(ptr) }) else {
+        return;
     };
-    // SAFETY: Swift passes a pointer to a local RstPoints.
+    c.wake.pending.store(false, Ordering::Release);
+    let f = c.core.frame();
+    let tick = c
+        .core
+        .next_tick()
+        .map(|d| d.as_millis().min(u128::from(u32::MAX)) as u32);
+    json::frame(&f, tick, &mut c.frame_json);
+    bytes(&c.frame_json, out);
+}
+
+/// The scene of a chart at `w`×`h` points. Kinds: 0 throughput, 1 latency,
+/// 2 overview, 3 box plot `index`, 4 RSSI. False for an unknown chart.
+#[unsafe(no_mangle)]
+pub extern "C" fn rst_chart(
+    ptr: *mut RstCore,
+    kind: u32,
+    index: u32,
+    w: f32,
+    h: f32,
+    label_h: f32,
+    out: *mut RstScene,
+) -> bool {
+    // SAFETY: the pointer Swift received from `rst_ui_main`.
+    let Some(c) = (unsafe { core(ptr) }) else {
+        return false;
+    };
+    let Some(id) = chart_id(kind, index) else {
+        return false;
+    };
+    let sc = c.core.scene(id, w.max(1.0), h.max(1.0), label_h.max(1.0));
+    let (plot, pts, text) = (sc.plot, sc.pts.as_ptr(), (sc.text.as_ptr(), sc.text.len()));
+    let n_pts = sc.pts.len();
+    let generation = c.core.scene_generation(id);
+    let entry = c.cmds.entry(id).or_insert_with(|| (u64::MAX, Vec::new()));
+    if entry.0 != generation {
+        let sc = c.core.scene(id, w.max(1.0), h.max(1.0), label_h.max(1.0));
+        entry.1.clear();
+        entry.1.extend(sc.prims.iter().map(encode));
+        entry.0 = generation;
+    }
+    // SAFETY: Swift passes a pointer to a local RstScene.
     if let Some(out) = unsafe { out.as_mut() } {
-        *out = pts;
+        *out = RstScene {
+            cmds: entry.1.as_ptr(),
+            n_cmds: entry.1.len() as u32,
+            pts: pts.cast(),
+            n_pts: n_pts as u32,
+            text: text.0,
+            n_text: text.1 as u32,
+            plot_x0: plot.x0,
+            plot_y0: plot.y0,
+            plot_x1: plot.x1,
+            plot_y1: plot.y1,
+            generation,
+        };
+    }
+    true
+}
+
+fn encode(p: &Prim) -> RstCmd {
+    match *p {
+        Prim::Line {
+            ref range,
+            color,
+            alpha,
+            width,
+            dashed,
+        } => RstCmd {
+            kind: 0,
+            color: color as u8,
+            flags: u8::from(dashed),
+            alpha,
+            a: width,
+            start: range.start,
+            end: range.end,
+            ..RstCmd::default()
+        },
+        Prim::Area {
+            ref range,
+            base,
+            color,
+            alpha,
+        } => RstCmd {
+            kind: 1,
+            color: color as u8,
+            alpha,
+            a: base,
+            start: range.start,
+            end: range.end,
+            ..RstCmd::default()
+        },
+        Prim::Rect {
+            rect,
+            color,
+            alpha,
+            filled,
+        } => RstCmd {
+            kind: 2,
+            color: color as u8,
+            flags: u8::from(filled),
+            alpha,
+            x0: rect.x0,
+            y0: rect.y0,
+            x1: rect.x1,
+            y1: rect.y1,
+            ..RstCmd::default()
+        },
+        Prim::Dots {
+            ref range,
+            radius,
+            color,
+            alpha,
+        } => RstCmd {
+            kind: 3,
+            color: color as u8,
+            alpha,
+            a: radius,
+            start: range.start,
+            end: range.end,
+            ..RstCmd::default()
+        },
+        Prim::Text {
+            at,
+            ref range,
+            size,
+            color,
+            h,
+            v,
+        } => RstCmd {
+            kind: 4,
+            color: color as u8,
+            flags: size as u8 | (h as u8) << 2 | (v as u8) << 4,
+            alpha: 1.0,
+            start: range.start,
+            end: range.end,
+            x0: at.x,
+            y0: at.y,
+            ..RstCmd::default()
+        },
+    }
+}
+
+/// Hover over a chart at chart-local `(x, y)`, as JSON.
+#[unsafe(no_mangle)]
+pub extern "C" fn rst_hover(
+    ptr: *mut RstCore,
+    kind: u32,
+    index: u32,
+    w: f32,
+    h: f32,
+    x: f32,
+    y: f32,
+    out: *mut RstBytes,
+) -> bool {
+    // SAFETY: the pointer Swift received from `rst_ui_main`.
+    let Some(c) = (unsafe { core(ptr) }) else {
+        return false;
+    };
+    let Some(id) = chart_id(kind, index) else {
+        return false;
+    };
+    let hv = c.core.hover(id, w, h, x, y);
+    json::hover(&hv, &mut c.hover_json);
+    bytes(&c.hover_json, out);
+    true
+}
+
+/// Commands; see `include/rst.h`.
+#[unsafe(no_mangle)]
+pub extern "C" fn rst_command(ptr: *mut RstCore, cmd: u32) {
+    // SAFETY: the pointer Swift received from `rst_ui_main`.
+    let Some(c) = (unsafe { core(ptr) }) else {
+        return;
+    };
+    let core = &mut c.core;
+    match cmd {
+        0 => core.start(),
+        1 => core.stop(),
+        2 => core.pause(),
+        3 => core.resume(),
+        4 => core.reset(),
+        5 => core.start_mode(RunMode::OneShot),
+        6 => core.start_mode(RunMode::Continuous),
+        7 => core.reset_view(),
+        8 => core.set_mode(RunMode::OneShot),
+        9 => core.set_mode(RunMode::Continuous),
+        _ => return,
+    }
+    // Show the effect right away.
+    c.wake.wake(Duration::ZERO);
+}
+
+/// Time-window gestures on the time-series charts: 0 zoom by `factor` at
+/// `x`, 1 pan by `x` points, 2 center the overview on `x`. `w` is the
+/// chart's width.
+#[unsafe(no_mangle)]
+pub extern "C" fn rst_view(ptr: *mut RstCore, op: u32, factor: f64, x: f32, w: f32) {
+    // SAFETY: the pointer Swift received from `rst_ui_main`.
+    let Some(c) = (unsafe { core(ptr) }) else {
+        return;
+    };
+    match op {
+        0 => c.core.zoom(factor, x, w),
+        1 => c.core.pan(x, w),
+        2 => c.core.center(x, w),
+        _ => {}
+    }
+}
+
+/// Choose option `index` of setting `setting` (`Setting` order).
+#[unsafe(no_mangle)]
+pub extern "C" fn rst_set(ptr: *mut RstCore, setting: u32, index: u32) {
+    // SAFETY: the pointer Swift received from `rst_ui_main`.
+    let Some(c) = (unsafe { core(ptr) }) else {
+        return;
+    };
+    if let Some(s) = u8::try_from(setting).ok().and_then(Setting::from_u8) {
+        c.core.set(s, index as usize);
+        c.wake.wake(Duration::ZERO);
+    }
+}
+
+/// Rows `first..first + count` of log tab `tab`, newest first, as JSON
+/// with the total row count.
+#[unsafe(no_mangle)]
+pub extern "C" fn rst_log(ptr: *mut RstCore, tab: u32, first: u32, count: u32, out: *mut RstBytes) {
+    // SAFETY: the pointer Swift received from `rst_ui_main`.
+    let Some(c) = (unsafe { core(ptr) }) else {
+        return;
+    };
+    let Some(tab) = u8::try_from(tab).ok().and_then(Tab::from_u8) else {
+        return;
+    };
+    let total = c.core.log_len(tab);
+    let rows = c.core.log_rows(tab, first as usize, count as usize);
+    json::log_page(total, &rows, &mut c.log_json);
+    bytes(&c.log_json, out);
+}
+
+/// Export every sample as JSON to the UTF-8 path; the result appears in the
+/// status line.
+#[unsafe(no_mangle)]
+pub extern "C" fn rst_export(ptr: *mut RstCore, path: *const u8, len: usize) {
+    // SAFETY: the pointer Swift received from `rst_ui_main`.
+    let Some(c) = (unsafe { core(ptr) }) else {
+        return;
+    };
+    if path.is_null() {
+        return;
+    }
+    // SAFETY: Swift passes a valid UTF-8 buffer of `len` bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(path, len) };
+    if let Ok(p) = std::str::from_utf8(bytes) {
+        c.core.export(PathBuf::from(p));
+    }
+}
+
+// Box plot ids are part of the ABI (chart kind 3's index).
+const _: () = {
+    assert!(BoxId::Download as u8 == 0 && BoxId::Udp as u8 == 4);
+    assert!(std::mem::size_of::<RstCmd>() == 36);
+};
+
+#[cfg(test)]
+mod tests {
+    /// Every function in the header is exported here, and vice versa.
+    #[test]
+    fn header_matches_exports() {
+        let header = include_str!("include/rst.h");
+        let src = include_str!("ffi.rs");
+        let mut exported: Vec<&str> = src
+            .split("pub extern \"C\" fn ")
+            .skip(1)
+            .filter_map(|s| s.split('(').next())
+            .collect();
+        exported.sort();
+        let mut declared: Vec<&str> = header
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//") && !l.contains("typedef"))
+            .filter_map(|l| l.split_once(" rst_").map(|(_, r)| r))
+            .filter_map(|r| r.split('(').next())
+            .filter(|n| *n != "ui_main")
+            .collect();
+        declared.sort();
+        declared.dedup();
+        let exported: Vec<String> = exported
+            .iter()
+            .map(|e| e.trim_start_matches("rst_").to_owned())
+            .collect();
+        assert_eq!(declared, exported);
     }
 }

@@ -97,6 +97,8 @@ pub struct Cell {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Row {
+    /// Stable while the row is held: its position since the run started.
+    pub id: u64,
     pub cells: Vec<Cell>,
     pub tip: Option<Tip>,
 }
@@ -138,12 +140,19 @@ pub fn rows(s: &Session, tab: Tab, first: usize, count: usize) -> Vec<Row> {
             .map(|w| format::clock(w, true))
             .unwrap_or_default()
     };
+    let evicted = match tab {
+        Tab::Requests => s.requests.evicted(),
+        Tab::Connections => s.conns.evicted(),
+        Tab::Errors => s.errors.evicted(),
+    };
     (first..(first + count).min(n))
         .filter_map(|i| {
             let k = n - 1 - i;
+            let id = evicted + k as u64;
             match tab {
-                Tab::Requests => s.requests.get(k).map(|r| request(r, &wall)),
+                Tab::Requests => s.requests.get(k).map(|r| request(id, r, &wall)),
                 Tab::Connections => s.conns.get(k).map(|c| Row {
+                    id,
                     cells: vec![
                         cell(wall(c.t)),
                         cell(c.purpose.label()),
@@ -163,6 +172,7 @@ pub fn rows(s: &Session, tab: Tab, first: usize, count: usize) -> Vec<Row> {
                     ),
                 }),
                 Tab::Errors => s.errors.get(k).map(|(t, m)| Row {
+                    id,
                     cells: vec![
                         cell(wall(*t)),
                         Cell {
@@ -177,7 +187,7 @@ pub fn rows(s: &Session, tab: Tab, first: usize, count: usize) -> Vec<Row> {
         .collect()
 }
 
-fn request(r: &crate::model::RequestRecord, wall: &dyn Fn(f64) -> String) -> Row {
+fn request(id: u64, r: &crate::model::RequestRecord, wall: &dyn Fn(f64) -> String) -> Row {
     let color = dir_color(r.dir);
     let retrans = match r.dir {
         Direction::Download => r.server_tcp.and_then(|t| t.retrans_packets),
@@ -258,6 +268,7 @@ fn request(r: &crate::model::RequestRecord, wall: &dyn Fn(f64) -> String) -> Row
         }
     }
     Row {
+        id,
         cells,
         tip: Some(t.note(
             "Edge counters come from the response's cfL4 Server-Timing entry and are cumulative for the connection when the headers were sent. Local counters are this machine's kernel TCP statistics after the request.",

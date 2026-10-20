@@ -21,8 +21,9 @@ pub type Waker = Arc<dyn Fn(Duration) + Send + Sync>;
 /// Redraw delay while a transfer streams throughput samples.
 const LIVE_FRAME: Duration = Duration::from_millis(33);
 /// Redraw delay for background probe results: several per second arrive
-/// in continuous mode and are shown together.
-const PROBE_FRAME: Duration = Duration::from_millis(250);
+/// in continuous mode and are shown together, about once per default
+/// latency probe interval.
+const PROBE_FRAME: Duration = Duration::from_secs(1);
 
 pub struct Controller {
     engine: Engine,

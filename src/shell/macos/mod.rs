@@ -4,6 +4,7 @@
 //! in `include/rst.h`.
 
 mod ffi;
+mod json;
 
 unsafe extern "C" {
     /// Defined in `swift/App.swift`; runs the app and never returns. The
