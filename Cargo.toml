@@ -106,6 +106,36 @@ adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
 # same Cairo context as the shapes. Already in every GTK install.
 pangocairo = "0.22"
 
+[target.'cfg(windows)'.dependencies]
+# Win32 bindings for the native Windows shell: windows and common controls
+# (v6, through the embedded manifest), Direct2D and DirectWrite for the
+# charts, DWM for the dark title bar and Mica, the notification-area icon
+# and IFileSaveDialog, and registry reads of the theme and accent colour.
+# Already in the tree through accesskit_windows; features kept to the
+# modules the shell calls.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_UI_Controls",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+] }
+# `Vector2`, the point type the Direct2D bindings take. Part of the windows
+# crate family and already in the tree as a dependency of `windows`, which
+# doesn't re-export it.
+windows-numerics = "0.3"
+
 [profile.release]
 opt-level = 3
 lto = true

@@ -1,6 +1,9 @@
 //! Raw Speed Test: a fine-grained internet speed test against Cloudflare's
 //! public speed test endpoints.
 
+// No console window on Windows; other targets ignore this.
+#![windows_subsystem = "windows"]
+
 mod app;
 mod engine;
 mod model;

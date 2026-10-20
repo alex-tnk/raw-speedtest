@@ -2664,6 +2664,8 @@ dependencies = [
  "pangocairo",
  "rustls",
  "webpki-roots",
+ "windows",
+ "windows-numerics",
 ]
 
 [[package]]

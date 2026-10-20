@@ -1,6 +1,7 @@
 //! Builds the native macOS shell: the SwiftUI sources under
 //! `src/shell/macos/swift` are compiled into a static library and linked
-//! into the binary. Other targets need nothing from here.
+//! into the binary. On Windows (MSVC) the application manifest is embedded
+//! into the executable. Linux needs nothing from here.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -10,6 +11,23 @@ fn main() {
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         swift_shell();
     }
+    if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        windows_manifest();
+    }
+}
+
+/// Embeds `packaging/windows/app.manifest` (common controls v6, per-monitor
+/// DPI awareness v2, UTF-8 code page) with the MSVC linker, so the
+/// executable stays a single file.
+fn windows_manifest() {
+    let dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let manifest = dir.join("packaging/windows/app.manifest");
+    println!("cargo:rerun-if-changed={}", manifest.display());
+    println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");
+    println!(
+        "cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}",
+        manifest.display()
+    );
 }
 
 fn xcrun(args: &[&str]) -> String {
