@@ -1,0 +1,4 @@
+module RawSpeedCore {
+    header "rst.h"
+    export *
+}

@@ -99,6 +99,13 @@ pub trait Platform: Send + Sync {
     /// Called once the main window exists.
     fn window_created(&self) {}
 
+    // Only macOS frameworks write preferences behind the app's back.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// Drop anything the OS UI frameworks stored in the app's preferences
+    /// (the app keeps none). Call right after such a write (a save panel, a
+    /// menu bar item), while the app runs, so nothing is pending at exit.
+    fn forget_preferences(&self) {}
+
     /// Whether the app can live in a menu bar (or tray) item.
     fn tray_supported(&self) -> bool {
         false
@@ -128,6 +135,22 @@ pub trait Platform: Send + Sync {
 
     /// Ask the user where to save an export. Blocks until answered.
     fn choose_save_path(&self, suggested_name: &str) -> Result<Option<PathBuf>, String>;
+}
+
+static QUIT_HOOK: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>> = std::sync::OnceLock::new();
+
+/// Registers how the UI quits through its normal path. Termination signals
+/// use it, so exit cleanup runs after the UI has stopped.
+// The Linux and Windows shells register one once they replace egui.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn set_quit_hook(hook: Box<dyn Fn() + Send + Sync>) {
+    let _ = QUIT_HOOK.set(hook);
+}
+
+/// Asks the UI to quit; false when no UI registered a hook.
+#[cfg_attr(target_os = "windows", allow(dead_code))] // only the Unix signal thread asks
+fn request_quit() -> bool {
+    QUIT_HOOK.get().map(|hook| hook()).is_some()
 }
 
 pub fn current() -> &'static dyn Platform {

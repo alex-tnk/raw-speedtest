@@ -78,8 +78,9 @@ pub fn utc_offset(unix_secs: i64) -> Option<i32> {
     Some(tm.tm_gmtoff as i32)
 }
 
-/// Turn SIGTERM, SIGINT and SIGHUP into a normal `exit(0)` so `atexit`
-/// cleanup runs. The signals are blocked in every thread (call this before
+/// Turn SIGTERM, SIGINT and SIGHUP into a normal quit (through the UI's
+/// quit hook when one is registered, else `exit(0)`) so `atexit` cleanup
+/// runs. The signals are blocked in every thread (call this before
 /// spawning any) and received by one thread with `sigwait`.
 pub fn exit_on_termination_signals() {
     // SAFETY: plain signal-set manipulation on a zeroed sigset_t.
@@ -98,6 +99,10 @@ pub fn exit_on_termination_signals() {
             let mut sig: libc::c_int = 0;
             // SAFETY: waiting on the signals blocked above.
             unsafe { libc::sigwait(&set, &mut sig) };
+            // Let the UI quit normally; exit anyway if it doesn't in time.
+            if super::request_quit() {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+            }
             std::process::exit(0);
         });
     if spawned.is_err() {

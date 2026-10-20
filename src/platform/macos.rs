@@ -56,7 +56,7 @@ extern "C" fn remove_empty_state_dirs() {
         (n > 1 && n <= buf.len())
             .then(|| String::from_utf8_lossy(&buf[..n - 1]).into_owned().into())
     }
-    let id = autoreleasepool(|_| {
+    let id = pool(|| {
         NSBundle::mainBundle()
             .bundleIdentifier()
             .map(|s| s.to_string())
@@ -91,14 +91,31 @@ extern "C" fn remove_empty_state_dirs() {
             remove_tree(&d);
         }
     }
-    // cfprefsd keeps an empty plist file after the save panel's keys are
-    // removed. The app stores no preferences, so a key-less file goes.
+    // The app stores no preferences. The shell clears what AppKit writes
+    // while running (`forget_preferences`), so normally only the empty file
+    // cfprefsd leaves is deleted here. If keys are still present, clear them
+    // and give cfprefsd a moment to write the emptied file first; it writes
+    // asynchronously, sometimes after the process has gone, which can leave
+    // an empty file behind.
+    let cleared_at = std::time::SystemTime::now();
+    let had_keys = forget_preferences();
     if let Some(home) = std::env::var_os("HOME") {
         let plist = std::path::Path::new(&home)
             .join("Library/Preferences")
             .join(format!("{id}.plist"));
-        let small = std::fs::metadata(&plist).is_ok_and(|m| m.is_file() && m.len() < 256);
-        if small && pref_keys().is_empty() {
+        if had_keys {
+            // The write to wait for is newer than the clear and holds an
+            // empty dictionary (an empty binary plist is 42 bytes).
+            for _ in 0..40 {
+                let emptied = std::fs::metadata(&plist)
+                    .is_ok_and(|m| m.len() <= 64 && m.modified().is_ok_and(|t| t >= cleared_at));
+                if emptied {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+        if pref_keys().is_empty() {
             let _ = std::fs::remove_file(&plist);
         }
     }
@@ -141,9 +158,37 @@ fn pref_domain() -> Option<Retained<NSString>> {
         .or_else(|| Some(NSProcessInfo::processInfo().processName()))
 }
 
+/// An autorelease pool without objc2's debug-build bookkeeping, which lives
+/// in thread-local storage that is already destroyed when `atexit` handlers
+/// run on the main thread.
+fn pool<T>(f: impl FnOnce() -> T) -> T {
+    // SAFETY: push and pop are balanced on this thread.
+    let p = unsafe { objc2::ffi::objc_autoreleasePoolPush() };
+    let r = f();
+    // SAFETY: pops the pool pushed above.
+    unsafe { objc2::ffi::objc_autoreleasePoolPop(p) };
+    r
+}
+
+/// Removes the app's persistent preferences domain if it holds anything.
+/// Returns whether there was something to remove.
+fn forget_preferences() -> bool {
+    if pref_keys().is_empty() {
+        return false;
+    }
+    pool(|| {
+        if let Some(domain) = pref_domain() {
+            let defaults = NSUserDefaults::standardUserDefaults();
+            defaults.removePersistentDomainForName(&domain);
+            defaults.synchronize();
+        }
+    });
+    true
+}
+
 /// Keys currently stored in the app's persistent preferences domain.
 fn pref_keys() -> Vec<String> {
-    autoreleasepool(|_| {
+    pool(|| {
         let Some(domain) = pref_domain() else {
             return Vec::new();
         };
@@ -562,6 +607,10 @@ impl Platform for MacOs {
 
     fn quit(&self) {
         macos_tray::quit();
+    }
+
+    fn forget_preferences(&self) {
+        forget_preferences();
     }
 
     fn choose_save_path(&self, suggested_name: &str) -> Result<Option<PathBuf>, String> {

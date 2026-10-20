@@ -1,0 +1,5 @@
+[env]
+# The macOS shell uses SwiftUI APIs from macOS 26 (Liquid Glass). Rust and
+# Swift objects must agree on the deployment target, or the Swift runtime's
+# back-deployment libraries are linked through @rpath and fail at launch.
+MACOSX_DEPLOYMENT_TARGET = "26.0"

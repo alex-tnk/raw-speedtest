@@ -26,6 +26,34 @@ use charts::TimeView;
 use charts::timeseries::{Charts, Inputs};
 use controls::Action;
 
+/// Runs the egui window until it closes.
+pub fn run() {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("Raw Speed Test")
+            .with_app_id("raw-speed-test")
+            .with_inner_size(theme::WINDOW_DEFAULT)
+            .with_min_inner_size(theme::WINDOW_MIN),
+        centered: true,
+        renderer: eframe::Renderer::Glow,
+        persist_window: false,
+        system_font_fallback: false,
+        ..Default::default()
+    };
+    let result = eframe::run_native(
+        "Raw Speed Test",
+        options,
+        Box::new(|cc| match SpeedApp::new(cc) {
+            Ok(app) => Ok(Box::new(app)),
+            Err(e) => Err(e.into()),
+        }),
+    );
+    if let Err(e) = result {
+        eprintln!("raw-speed-test: {e}");
+        std::process::exit(1);
+    }
+}
+
 pub struct SpeedApp {
     ctl: Controller,
     text: text::Text,
