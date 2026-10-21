@@ -9,8 +9,7 @@ use super::widgets::{self, Kind, Tip, tooltip};
 use super::{format, theme};
 use crate::app::derived::Derived;
 use crate::app::session::{RunState, Session};
-use crate::engine::size_label;
-use crate::model::{Config, IpFamily, Payload, Phase, RunMode};
+use crate::model::{Config, IpFamily, Phase, RunMode};
 
 pub enum Action {
     Start,
@@ -58,13 +57,8 @@ pub(super) fn status(s: &Session, notice: Option<(&str, bool)>) -> (String, Colo
                 format!("Measuring latency · {done}/{total} probes"),
                 theme::TEXT,
             ),
-            Some(Phase::Transfer {
-                dir,
-                size,
-                index,
-                count,
-            }) => (
-                format!("{} {} · {index}/{count}", dir.label(), size_label(*size)),
+            Some(Phase::Sustained { dir, streams, .. }) => (
+                format!("{} · {streams} connections", dir.label()),
                 theme::TEXT,
             ),
             Some(Phase::PacketLoss { sent, total }) => (
@@ -198,13 +192,6 @@ const INTERVALS: [(u64, &str); 7] = [
     (1800, "30 min"),
     (3600, "60 min"),
 ];
-const PAYLOADS: [(Payload, &str); 4] = [
-    (Payload::Auto, "Auto"),
-    (Payload::Bytes(1_000_000), "1 MB"),
-    (Payload::Bytes(10_000_000), "10 MB"),
-    (Payload::Bytes(25_000_000), "25 MB"),
-];
-const REQUESTS: [u32; 4] = [1, 2, 3, 5];
 const LATENCY_MS: [(u64, &str); 5] = [
     (500, "0.5 s"),
     (1000, "1 s"),
@@ -246,18 +233,6 @@ pub fn settings(
             c.cycle_interval = Duration::from_secs(INTERVALS[i].0);
             changed = true;
         }
-        let pi = PAYLOADS.iter().position(|(p, _)| *p == c.payload).unwrap_or(0);
-        if let Some(i) = widgets::option_row(ui, text, "Payload", &PAYLOADS.map(|x| x.1), pi) {
-            c.payload = PAYLOADS[i].0;
-            changed = true;
-        }
-        let ri = REQUESTS.iter().position(|r| *r == c.requests).unwrap_or(1);
-        let rl = REQUESTS.map(|r| r.to_string());
-        let rl: Vec<&str> = rl.iter().map(String::as_str).collect();
-        if let Some(i) = widgets::option_row(ui, text, "Requests per cycle", &rl, ri) {
-            c.requests = REQUESTS[i];
-            changed = true;
-        }
         let li = LATENCY_MS
             .iter()
             .position(|(ms, _)| Duration::from_millis(*ms) == c.latency_interval)
@@ -285,12 +260,8 @@ pub fn settings(
             menu_bar_change = Some(i == 1);
         }
         // Throughput data per hour at these settings.
-        let size = |rate: Option<f64>| match c.payload {
-            Payload::Bytes(b) => Some(b as f64),
-            Payload::Auto => rate.map(|bps| (bps / 8.0).clamp(100e3, 25e6)),
-        };
-        let per_cycle = match (size(d.download.value), size(d.upload.value)) {
-            (Some(a), Some(b)) => Some((a + b) * f64::from(c.requests)),
+        let per_cycle = match (d.download.value, d.upload.value) {
+            (Some(a), Some(b)) => Some((a + b) / 8.0 * c.sustain.as_secs_f64()),
             _ => None,
         };
         let per_hour = per_cycle.map(|b| b * 3600.0 / c.cycle_interval.as_secs_f64());

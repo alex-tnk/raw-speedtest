@@ -2,7 +2,8 @@
 //! and reports `Event`s over channels. It knows nothing about the UI.
 //!
 //! A run has four workers:
-//! - `schedule`: the test plan (one-shot suite or continuous cycles),
+//! - `schedule`: the test plan (one-shot suite or continuous cycles), which
+//!   runs sustained transfers on a thread per stream,
 //! - `latency`: periodic and loaded latency probes on their own connection,
 //! - `packet_loss`: UDP STUN probes,
 //! - `local`: gateway pings, Wi-Fi and interface sampling.
@@ -14,6 +15,7 @@ mod meta;
 mod packet_loss;
 mod sampler;
 mod schedule;
+mod sustained;
 mod upload;
 
 use std::net::IpAddr;

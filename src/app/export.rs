@@ -279,10 +279,11 @@ pub fn to_json(ses: &Session) -> String {
         }
         let _ = write!(
             o,
-            "{{\"id\":{},\"conn\":{},\"new_conn\":{},\"direction\":\"{}\",\"size\":{},\"bytes\":{},\"index\":{},\"count\":{},\"t_start\":",
+            "{{\"id\":{},\"conn\":{},\"new_conn\":{},\"sustained\":{},\"direction\":\"{}\",\"size\":{},\"bytes\":{},\"stream\":{},\"streams\":{},\"t_start\":",
             r.id,
             r.conn,
             r.new_conn,
+            r.sustained.map_or("null".to_owned(), |v| v.to_string()),
             r.dir.lower(),
             r.size,
             r.bytes,
@@ -309,6 +310,32 @@ pub fn to_json(ses: &Session) -> String {
         o.push('}');
     }
 
+    o.push_str("],\"sustained\":[");
+    for (i, r) in ses.sustained.iter().enumerate() {
+        if i > 0 {
+            o.push(',');
+        }
+        let _ = write!(
+            o,
+            "{{\"id\":{},\"direction\":\"{}\",\"streams\":{},\"requests\":{},\"bytes\":{},\"steady_bytes\":{},\"complete\":{},\"t_start\":",
+            r.id,
+            r.dir.lower(),
+            r.streams,
+            r.requests,
+            r.bytes,
+            r.steady_bytes,
+            r.complete
+        );
+        num(&mut o, r.t_start);
+        o.push_str(",\"t_steady\":");
+        num(&mut o, r.t_steady);
+        o.push_str(",\"t_end\":");
+        num(&mut o, r.t_end);
+        o.push_str(",\"bps\":");
+        opt(&mut o, r.bps);
+        o.push('}');
+    }
+
     o.push_str("],\"throughput\":[");
     for (i, x) in ses.throughput[0]
         .raw
@@ -327,7 +354,7 @@ pub fn to_json(ses: &Session) -> String {
         num(&mut o, x.bps);
         let _ = write!(
             o,
-            ",\"direction\":\"{}\",\"request\":{},\"bin\":{}}}",
+            ",\"direction\":\"{}\",\"transfer\":{},\"bin\":{}}}",
             x.dir.lower(),
             x.request,
             x.bin

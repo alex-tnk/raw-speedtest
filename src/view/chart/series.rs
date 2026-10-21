@@ -6,9 +6,9 @@ use super::{
     Decimator, Hover, TimeView, Transform, nice_max, nice_ticks, percentile_labels, robust_top,
     segments, time_axis, time_plot, value_axis,
 };
-use crate::app::session::{RunState, Session};
+use crate::app::session::{RunState, Session, Transfer};
 use crate::engine::size_label;
-use crate::model::{Direction, ProbeOutcome, RequestRecord};
+use crate::model::{Direction, Phase, ProbeOutcome};
 use crate::stats::{Bucket, Sample, Series as SampleSeries, Tier};
 use crate::view::format;
 use crate::view::palette::{self, Color, GATEWAY};
@@ -55,12 +55,14 @@ struct LatStats {
 /// What the throughput chart's axis and mode are computed from.
 #[derive(Clone, Copy, Default)]
 struct TputStats {
-    /// Highest 50 ms bin and highest request throughput in view.
+    /// Highest 50 ms bin, its robust top, and highest transfer throughput
+    /// in view.
     bins_max: f64,
+    bins_top: f64,
     req_max: f64,
     /// Mean request duration in view, seconds.
     mean_req_secs: f64,
-    /// Per direction, (p50, p90) of request throughput in view.
+    /// Per direction, (p50, p90) of transfer throughput in view.
     pct: [Pct; 2],
 }
 
@@ -229,18 +231,14 @@ fn feed_buckets(dec: &mut Decimator<'_>, tier: &Tier, tf: &Transform) {
     }
 }
 
-/// Index range of the requests overlapping `[t0, t1]`, with a few of
-/// margin on each side so trend lines run to the plot edges.
-fn visible_requests(s: &Session, t0: f64, t1: f64) -> (usize, usize) {
-    let a = s.requests.partition_point(|r| r.t_end < t0);
-    let b = s.requests.partition_point(|r| r.t_start <= t1);
-    (a.saturating_sub(4), (b + 4).min(s.requests.len()))
-}
+/// Transfers kept beyond each edge of the view, so trend lines run to the
+/// plot edges.
+const TREND_MARGIN: usize = 4;
 
-/// Feeds `dec` a line through each set's median request throughput in
-/// direction `dir` (requests of one cycle run back to back) and puts every
-/// request's point in `dots`.
-fn request_trend(
+/// Feeds `dec` a line through each set's median throughput in direction
+/// `dir` (transfers of one cycle run back to back) and puts every
+/// transfer's point in `dots`.
+fn transfer_trend(
     dec: &mut Decimator<'_>,
     dots: &mut Vec<Point>,
     vals: &mut Vec<f64>,
@@ -248,8 +246,7 @@ fn request_trend(
     dir: Direction,
     tf: &Transform,
 ) {
-    let gap_limit = request_gap(s);
-    let (ra, rb) = visible_requests(s, tf.t0, tf.t1);
+    let gap_limit = transfer_gap(s);
     let mut prev: Option<f64> = None;
     let mut set: Option<(f64, f64)> = None;
     vals.clear();
@@ -264,91 +261,129 @@ fn request_trend(
         }
         vals.clear();
     };
-    for r in s.requests.range(ra, rb).filter(|r| r.dir == dir) {
-        let Some(b) = r.bps else { continue };
+    for x in s
+        .transfers(tf.t0, tf.t1, TREND_MARGIN)
+        .filter(|x| x.dir() == dir)
+    {
+        let Some(b) = x.bps() else { continue };
         match &mut set {
-            Some(st) if r.t_start - st.1 <= SET_GAP => st.1 = r.t_end,
+            Some(st) if x.t_start() - st.1 <= SET_GAP => st.1 = x.t_end(),
             _ => {
                 if let Some(st) = set {
                     flush(dec, vals, st);
                 }
-                set = Some((r.t_start, r.t_end));
+                set = Some((x.t_start(), x.t_end()));
             }
         }
         vals.push(b);
-        dots.push(tf.pos((r.t_start + r.t_end) / 2.0, b));
+        dots.push(tf.pos(mid(&x), b));
     }
     if let Some(st) = set {
         flush(dec, vals, st);
     }
 }
 
+fn mid(x: &Transfer<'_>) -> f64 {
+    (x.t_start() + x.t_end()) / 2.0
+}
+
 /// How many bins a hover looks past on each side for one that is drawn.
 const BIN_SEARCH: usize = 256;
 
-/// Requests starting within this of the previous one's end belong to the
-/// same set (one continuous cycle, or one one-shot set).
-const SET_GAP: f64 = 10.0;
+/// Transfers starting within this of the previous one's end belong to the
+/// same set (one continuous cycle, or one one-shot test).
+const SET_GAP: f64 = 30.0;
 
-/// Requests further apart than this aren't joined by the trend line:
+/// Transfers further apart than this aren't joined by the trend line:
 /// a few continuous cycles missed (stopped, paused, failing).
-fn request_gap(s: &Session) -> f64 {
+fn transfer_gap(s: &Session) -> f64 {
     (3.0 * s.config.continuous.cycle_interval.as_secs_f64()).max(120.0)
 }
 
-/// The request point nearest the pointer, when requests are drawn as
-/// points.
-/// Whether request `r` is too narrow at this zoom to show its bins.
-fn narrow_request(tf: &Transform, r: &RequestRecord) -> bool {
-    tf.x(r.t_end) - tf.x(r.t_start) < palette::REQUEST_MIN_WIDTH
+/// Whether transfer `x` is too narrow at this zoom to show its bins.
+fn too_narrow(tf: &Transform, x: &Transfer<'_>) -> bool {
+    tf.x(x.t_end()) - tf.x(x.t_start()) < palette::REQUEST_MIN_WIDTH
 }
 
-/// The request point nearest the pointer among those `only` admits, with
+/// Title, values and how it's measured, for transfer `x`.
+fn transfer_tip(inp: &Inputs<'_>, x: &Transfer<'_>, zoomed_out: bool) -> Tip {
+    let zoom = if zoomed_out {
+        " Zoom in to see its 50 ms bins."
+    } else {
+        ""
+    };
+    match x {
+        Transfer::Sustained(r) => {
+            let mut tip =
+                Tip::default().title(format!("{} · {} connections", r.dir.label(), r.streams));
+            if let Some(b) = r.bps {
+                tip.push_pair("Throughput", format!("{} Mbps", format::mbps(b)));
+            }
+            tip.push_pair("Start", wall(inp, r.t_start));
+            tip.push_pair("Length", format!("{} s", format::sig3(r.t_end - r.t_start)));
+            tip.push_pair("Data", format!("{} MB", format::sig3(r.bytes as f64 / 1e6)));
+            tip.push_pair("Requests", format::count(u64::from(r.requests)));
+            if !r.complete {
+                tip.push_pair("Ended", "early".to_owned());
+            }
+            tip.note(format!(
+                "Bytes {} on every connection after the first {} s (TCP ramp-up), over that time.{zoom}",
+                match r.dir {
+                    Direction::Download => "received",
+                    Direction::Upload => "acknowledged by the server",
+                },
+                format::sig3(r.t_steady - r.t_start)
+            ))
+        }
+        Transfer::Single(r) => {
+            let mut tip = Tip::default().title(format!(
+                "{} {} · sample {}/{}",
+                size_label(r.size),
+                r.dir.lower(),
+                r.index,
+                r.count
+            ));
+            if let Some(b) = r.bps {
+                tip.push_pair("Throughput", format!("{} Mbps", format::mbps(b)));
+            }
+            tip.push_pair("Start", wall(inp, r.t_start));
+            tip.push_pair("Duration", format!("{} ms", format::ms(r.duration_ms)));
+            tip.push_pair("TTFB", format!("{} ms", format::ms(r.ttfb_ms)));
+            tip.note(format!(
+                "{}{zoom}",
+                match r.dir {
+                    Direction::Download => {
+                        "Bits received over TTFB minus server time plus transfer time."
+                    }
+                    Direction::Upload => "Bits sent over request start to first response byte.",
+                }
+            ))
+        }
+    }
+}
+
+/// The transfer point nearest the pointer among those `only` admits, with
 /// its distance score; `None` if none is near.
-fn request_hover(
+fn transfer_hover(
     inp: &Inputs<'_>,
     tf: &Transform,
     hp: Point,
-    only: impl Fn(&RequestRecord) -> bool,
+    only: impl Fn(&Transfer<'_>) -> bool,
 ) -> Option<(Hover, f32)> {
-    let s = inp.s;
-    let (ra, rb) = visible_requests(s, tf.t0, tf.t1);
-    let near = s
-        .requests
-        .range(ra, rb)
-        .filter(|r| only(r))
-        .filter_map(|r| {
-            let p = tf.pos((r.t_start + r.t_end) / 2.0, r.bps?);
-            Some((r, p, (p.x - hp.x).abs() + 0.25 * (p.y - hp.y).abs()))
+    let near = inp
+        .s
+        .transfers(tf.t0, tf.t1, TREND_MARGIN)
+        .filter(|x| only(x))
+        .filter_map(|x| {
+            let p = tf.pos(mid(&x), x.bps()?);
+            Some((x, p, (p.x - hp.x).abs() + 0.25 * (p.y - hp.y).abs()))
         })
         .min_by(|a, b| a.2.total_cmp(&b.2));
-    let (r, p, d) = near.filter(|(_, p, _)| (p.x - hp.x).abs() <= palette::SNAP_PX)?;
-    let mut tip = Tip::default().title(format!(
-        "{} {} · sample {}/{}",
-        size_label(r.size),
-        r.dir.lower(),
-        r.index,
-        r.count
-    ));
-    tip.push_pair(
-        "Throughput",
-        format!("{} Mbps", format::mbps(r.bps.unwrap_or(0.0))),
-    );
-    tip.push_pair("Start", wall(inp, r.t_start));
-    tip.push_pair("Duration", format!("{} ms", format::ms(r.duration_ms)));
-    tip.push_pair("TTFB", format!("{} ms", format::ms(r.ttfb_ms)));
-    let tip = tip.note(match r.dir {
-        Direction::Download => {
-            "One point per request: bits received over TTFB minus server time plus transfer time. Zoom in to see its 50 ms bins."
-        }
-        Direction::Upload => {
-            "One point per request: bits sent over request start to first response byte. Zoom in to see its 50 ms bins."
-        }
-    });
+    let (x, p, d) = near.filter(|(_, p, _)| (p.x - hp.x).abs() <= palette::SNAP_PX)?;
     let hv = Hover {
         crosshair: Some(p.x),
-        highlight: Some((p, dir_color(r.dir))),
-        tip: Some(tip),
+        highlight: Some((p, dir_color(x.dir()))),
+        tip: Some(transfer_tip(inp, &x, true)),
         anchor: p,
     };
     Some((hv, d))
@@ -571,21 +606,11 @@ fn band_tip(inp: &Inputs<'_>, t: f64) -> Option<Tip> {
         tip.push_pair("To", p1.map_or("now".to_owned(), |p| wall(inp, p)));
         return Some(tip);
     }
-    let i = s.requests.partition_point(|r| r.t_end < t);
-    let r = s.requests.get(i).filter(|r| r.t_start <= t)?;
-    let mut tip = Tip::default().title(format!(
-        "{} {} · sample {}/{}",
-        size_label(r.size),
-        r.dir.lower(),
-        r.index,
-        r.count
-    ));
-    tip.push_pair("Start", wall(inp, r.t_start));
-    tip.push_pair("End", wall(inp, r.t_end));
-    if let Some(b) = r.bps {
-        tip.push_pair("Throughput", format!("{} Mbps", format::mbps(b)));
-    }
-    Some(tip.note("Shaded while a download or upload request is in flight."))
+    let x = s
+        .transfers(t, t, 0)
+        .find(|x| x.t_start() <= t && x.t_end() >= t)?;
+    let tip = transfer_tip(inp, &x, false);
+    Some(tip.note("Shaded while a download or upload is running."))
 }
 
 impl Charts {
@@ -593,10 +618,12 @@ impl Charts {
         let vals = &mut self.vals;
         self.tput_stats.get(stats_key(s, view), || {
             let mut bins_max: f64 = 0.0;
+            vals.clear();
             for series in &s.throughput {
                 let (a, b) = visible(series, t0, t1);
                 for x in series.raw.range(a, b) {
                     bins_max = bins_max.max(x.bps);
+                    vals.push(x.bps);
                 }
                 if let Some((tier, until)) = aged_tier(series, t0, t1) {
                     for bk in tier
@@ -607,14 +634,12 @@ impl Charts {
                     }
                 }
             }
+            let n_bins = vals.len();
+            let bins_p99 = crate::stats::summarize(vals).map(|sm| sm.p99);
             let (mut req_max, mut dur, mut n) = (0.0f64, 0.0, 0u32);
-            let first = s.requests.partition_point(|r| r.t_end < t0);
-            for r in s.requests.range(first, s.requests.len()) {
-                if r.t_start > t1 {
-                    break;
-                }
-                req_max = req_max.max(r.bps.unwrap_or(0.0));
-                dur += r.t_end - r.t_start;
+            for x in s.transfers(t0, t1, 0) {
+                req_max = req_max.max(x.bps().unwrap_or(0.0));
+                dur += x.t_end() - x.t_start();
                 n += 1;
             }
             let mut pct = [None, None];
@@ -624,13 +649,14 @@ impl Charts {
             {
                 vals.clear();
                 vals.extend(
-                    s.requests_in(dir)
-                        .filter(|r| r.t_end >= t0 && r.t_start <= t1)
-                        .filter_map(|r| r.bps),
+                    s.transfers(t0, t1, 0)
+                        .filter(|x| x.dir() == dir)
+                        .filter_map(|x| x.bps()),
                 );
                 pct[i] = crate::stats::summarize(vals).map(|sm| (sm.median, sm.p90));
             }
             TputStats {
+                bins_top: robust_top(bins_max, bins_p99, n_bins),
                 bins_max,
                 req_max,
                 mean_req_secs: if n > 0 { dur / f64::from(n) } else { 0.0 },
@@ -648,26 +674,29 @@ impl Charts {
         view: &TimeView,
         w: f32,
         h: f32,
-    ) -> (Transform, bool, [Pct; 2], bool) {
+    ) -> (Transform, bool, [Pct; 2], bool, Option<f64>) {
         let (t0, t1) = view.range(inp.run_end);
         let st = self.throughput_stats(inp.s, view, t0, t1);
         let rect = time_plot(w, h);
         let secs_per_pt = (t1 - t0) / f64::from(rect.width().max(1.0));
         let narrow = st.req_max > 0.0
             && st.mean_req_secs < f64::from(palette::REQUEST_MIN_WIDTH) * secs_per_pt;
-        let vmax = if narrow {
-            st.req_max
+        let (vmax, top) = if narrow {
+            (st.req_max, nice_max(st.req_max))
         } else {
-            st.bins_max.max(st.req_max)
+            let max = st.bins_max.max(st.req_max);
+            (max, st.bins_top.max(nice_max(st.req_max)))
         };
         let tf = Transform {
             rect,
             t0,
             t1,
             v0: 0.0,
-            v1: nice_max(vmax),
+            v1: top,
         };
-        (tf, vmax > 0.0, st.pct, narrow)
+        // The maximum, when rare spikes run past the top of the axis.
+        let cut = (vmax > top).then_some(vmax);
+        (tf, vmax > 0.0, st.pct, narrow, cut)
     }
 
     /// Throughput chart of `w`×`h` points.
@@ -680,7 +709,7 @@ impl Charts {
         label_h: f32,
         sc: &mut Scene,
     ) {
-        let (tf, has_data, pct, narrow) = self.throughput_tf(inp, view, w, h);
+        let (tf, has_data, pct, narrow, cut) = self.throughput_tf(inp, view, w, h);
         let plot = tf.rect;
         let s = inp.s;
         sc.clear(plot);
@@ -715,10 +744,10 @@ impl Charts {
             let (a, e) = visible(series, t0, t1);
             let mut dec = Decimator::new(&mut self.pts, &mut self.breaks);
             if narrow {
-                // One point per request at its throughput, joined in time
+                // One point per transfer at its throughput, joined in time
                 // order: the trend across cycles.
                 self.aux.clear();
-                request_trend(&mut dec, &mut self.aux, &mut self.vals, s, dir, &tf);
+                transfer_trend(&mut dec, &mut self.aux, &mut self.vals, s, dir, &tf);
             } else if coarse(e - a, plot) {
                 feed_buckets(&mut dec, tier_for(series, t0), &tf);
             } else {
@@ -728,12 +757,12 @@ impl Charts {
                 let mut prev: Option<(u32, f64)> = None;
                 let mut skip: Option<(u32, bool)> = None;
                 for x in series.raw.range(a, e) {
-                    // Requests too narrow to show their bins are drawn as
+                    // Transfers too narrow to show their bins are drawn as
                     // one point below instead.
                     let narrow_req = match skip {
                         Some((id, n)) if id == x.request => n,
                         _ => {
-                            let n = s.request(x.request).is_some_and(|r| narrow_request(&tf, r));
+                            let n = s.transfer(x.request).is_some_and(|r| too_narrow(&tf, &r));
                             skip = Some((x.request, n));
                             n
                         }
@@ -746,16 +775,14 @@ impl Charts {
                     {
                         dec.gap();
                     }
-                    dec.push(tf.pos(x.t, x.bps));
+                    dec.push(tf.posc(x.t, x.bps));
                     prev = Some((x.request, x.t));
                 }
                 self.aux.clear();
-                let (ra, rb) = visible_requests(s, t0, t1);
                 self.aux.extend(
-                    s.requests
-                        .range(ra, rb)
-                        .filter(|r| r.dir == dir && narrow_request(&tf, r))
-                        .filter_map(|r| Some(tf.pos((r.t_start + r.t_end) / 2.0, r.bps?))),
+                    s.transfers(t0, t1, 0)
+                        .filter(|x| x.dir() == dir && too_narrow(&tf, x))
+                        .filter_map(|x| Some(tf.pos(mid(&x), x.bps()?))),
                 );
             }
             dec.finish();
@@ -770,7 +797,7 @@ impl Charts {
             if !narrow || self.aux.len() as f32 <= plot.width() / palette::DOT_MIN_SPACING {
                 sc.dots(&self.aux, palette::POINT_RADIUS, color, 1.0);
             }
-            // Percentiles of per-request throughput in view.
+            // Percentiles of transfer throughput in view.
             if let Some((p50, p90)) = pct[di] {
                 for v in [p50, p90] {
                     let y = tf.y(v).round() + 0.5;
@@ -790,6 +817,9 @@ impl Charts {
                 }
             }
         }
+        if let Some(max) = cut {
+            labels.push((plot.y0, format!("max {}", format::si(max)), Color::Text2));
+        }
         percentile_labels(sc, plot, label_h, &mut labels);
     }
 
@@ -801,17 +831,17 @@ impl Charts {
         h: f32,
         hp: Point,
     ) -> Hover {
-        let (tf, has_data, _, narrow) = self.throughput_tf(inp, view, w, h);
+        let (tf, has_data, _, narrow, _) = self.throughput_tf(inp, view, w, h);
         let plot = tf.rect;
         let s = inp.s;
         if !has_data || !plot.contains(hp) {
             return Hover::default();
         }
         if narrow {
-            return request_hover(inp, &tf, hp, |_| true).map_or_else(Hover::default, |h| h.0);
+            return transfer_hover(inp, &tf, hp, |_| true).map_or_else(Hover::default, |h| h.0);
         }
-        // Requests too narrow for their bins are drawn as points.
-        let req = request_hover(inp, &tf, hp, |r| narrow_request(&tf, r));
+        // Transfers too narrow for their bins are drawn as points.
+        let req = transfer_hover(inp, &tf, hp, |x| too_narrow(&tf, x));
         let th = tf.t_at(hp.x);
         if let Some((tier, until)) =
             aged_tier(&s.throughput[0], tf.t0, tf.t1).or(aged_tier(&s.throughput[1], tf.t0, tf.t1))
@@ -836,9 +866,9 @@ impl Charts {
         }
         // Nearest bin in either direction, by horizontal distance, then
         // vertical when both are close.
-        // Bins of narrow requests aren't drawn, so they're skipped.
+        // Bins of narrow transfers aren't drawn, so they're skipped.
         let shown = |x: &crate::model::ThroughputSample| {
-            !s.request(x.request).is_some_and(|r| narrow_request(&tf, r))
+            !s.transfer(x.request).is_some_and(|r| too_narrow(&tf, &r))
         };
         let mut best: Option<(f32, usize, usize)> = None;
         for (di, series) in s.throughput.iter().enumerate() {
@@ -850,7 +880,7 @@ impl Charts {
                 .find(|&j| series.raw.get(j).is_some_and(shown));
             for j in [left, right].into_iter().flatten() {
                 if let Some(x) = series.raw.get(j) {
-                    let p = tf.pos(x.t, x.bps);
+                    let p = tf.posc(x.t, x.bps);
                     let d = (p.x - hp.x).abs() + 0.25 * (p.y - hp.y).abs();
                     if best.is_none_or(|(bd, _, _)| d < bd) {
                         best = Some((d, di, j));
@@ -869,19 +899,23 @@ impl Charts {
         let Some(x) = s.throughput[di].raw.get(j).copied() else {
             return Hover::default();
         };
-        let p = tf.pos(x.t, x.bps);
+        let p = tf.posc(x.t, x.bps);
         if (p.x - hp.x).abs() > palette::SNAP_PX {
             return Hover::default();
         }
-        let mut tip = match s.request(x.request) {
-            Some(r) => Tip::default().title(format!(
+        let xfer = s.transfer(x.request);
+        let mut tip = match xfer {
+            Some(Transfer::Sustained(r)) => {
+                Tip::default().title(format!("{} · {} connections", r.dir.label(), r.streams))
+            }
+            Some(Transfer::Single(r)) => Tip::default().title(format!(
                 "{} {} · sample {}/{}",
                 size_label(r.size),
                 x.dir.lower(),
                 r.index,
                 r.count
             )),
-            None => Tip::default().title(format!("{} · request in progress", x.dir.label())),
+            None => Tip::default().title(format!("{} · in progress", x.dir.label())),
         };
         tip.push_pair("Throughput", format!("{} Mbps", format::mbps(x.bps)));
         tip.push_pair("Time", wall(inp, x.t));
@@ -889,15 +923,15 @@ impl Charts {
             "Bin",
             format!("{} · {:.0} ms", x.bin + 1, f64::from(x.dt) * 1000.0),
         );
-        if let Some(r) = s.request(x.request)
-            && let Some(b) = r.bps
-        {
-            tip.push_pair("Request", format!("{} Mbps", format::mbps(b)));
+        if let Some(b) = xfer.and_then(|r| r.bps()) {
+            tip.push_pair("Whole transfer", format!("{} Mbps", format::mbps(b)));
         }
         let tip = tip.note(match x.dir {
-            Direction::Download => "Body bytes received in the bin, divided by the bin length.",
+            Direction::Download => {
+                "Body bytes received on every connection in the bin, divided by the bin length."
+            }
             Direction::Upload => {
-                "Bytes the server acknowledged in the bin (kernel TCP counters), divided by the bin length."
+                "Bytes the server acknowledged on every connection in the bin (kernel TCP counters), divided by the bin length."
             }
         });
         Hover {
@@ -1021,13 +1055,20 @@ impl Charts {
         }
         let gap_limit = (3.5 * s.config.continuous.latency_interval.as_secs_f64()).max(2.0);
         // Load periods: when a download or upload was running.
-        let first = s.requests.partition_point(|r| r.t_end < t0);
-        for r in s.requests.range(first, s.requests.len()) {
-            if r.t_start > t1 {
-                break;
+        // The one running now has no record yet.
+        let running = match s.phase {
+            Some(Phase::Sustained { dir, started, .. }) if s.state == RunState::Running => {
+                Some((dir, started, inp.run_end))
             }
-            let x0 = tf.x(r.t_start).max(plot.x0);
-            let x1 = tf.x(r.t_end).min(plot.x1);
+            _ => None,
+        };
+        let bands = s
+            .transfers(t0, t1, 0)
+            .map(|x| (x.dir(), x.t_start(), x.t_end()))
+            .chain(running);
+        for (dir, a, b) in bands {
+            let x0 = tf.x(a).max(plot.x0);
+            let x1 = tf.x(b).min(plot.x1);
             if x1 > x0 {
                 sc.fill(
                     Rect {
@@ -1036,7 +1077,7 @@ impl Charts {
                         x1,
                         y1: data.y1,
                     },
-                    dir_color(r.dir),
+                    dir_color(dir),
                     palette::BAND_ALPHA,
                 );
             }
@@ -1428,7 +1469,7 @@ impl Charts {
             let mut dec = Decimator::new(&mut self.pts, &mut self.breaks);
             if narrow {
                 self.aux.clear();
-                request_trend(&mut dec, &mut self.aux, &mut self.vals, s, dir_of(di), &tf);
+                transfer_trend(&mut dec, &mut self.aux, &mut self.vals, s, dir_of(di), &tf);
                 dec.finish();
                 for (i, j) in segments(&self.breaks) {
                     sc.line(&self.pts[i..j], palette::STROKE, color, 1.0);
@@ -1530,7 +1571,7 @@ impl Charts {
 }
 
 /// The overview strip spans the whole run across the time plots' extent.
-/// True with it when requests are too narrow at this scale to show their
+/// True with it when transfers are too narrow at this scale to show their
 /// bins, so it draws the per-cycle trend.
 pub fn overview_tf(inp: &Inputs<'_>, w: f32, h: f32) -> (Transform, bool) {
     let x = time_plot(w, h);
@@ -1542,14 +1583,14 @@ pub fn overview_tf(inp: &Inputs<'_>, w: f32, h: f32) -> (Transform, bool) {
     };
     let t1 = inp.run_end.max(1.0);
     let s = inp.s;
-    let (mut req_max, mut dur) = (0.0f64, 0.0);
-    for r in s.requests.iter() {
-        req_max = req_max.max(r.bps.unwrap_or(0.0));
-        dur += r.t_end - r.t_start;
+    let (mut req_max, mut dur, mut n) = (0.0f64, 0.0, 0u32);
+    for x in s.transfers(0.0, t1, 0) {
+        req_max = req_max.max(x.bps().unwrap_or(0.0));
+        dur += x.t_end() - x.t_start();
+        n += 1;
     }
     let secs_per_pt = t1 / f64::from(rect.width().max(1.0));
-    let narrow = !s.requests.is_empty()
-        && dur / (s.requests.len() as f64) < f64::from(palette::REQUEST_MIN_WIDTH) * secs_per_pt;
+    let narrow = n > 0 && dur / f64::from(n) < f64::from(palette::REQUEST_MIN_WIDTH) * secs_per_pt;
     let mut vmax: f64 = 0.0;
     if narrow {
         vmax = req_max;

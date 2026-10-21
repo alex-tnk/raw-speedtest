@@ -86,22 +86,12 @@ impl IpFamily {
     }
 }
 
-/// Payload per throughput request in continuous mode.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Payload {
-    /// Size each request so it lasts about one second at the last measured
-    /// rate, within `[100 kB, 25 MB]`.
-    Auto,
-    Bytes(u64),
-}
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ContinuousConfig {
     /// Time between the starts of two throughput cycles.
     pub cycle_interval: Duration,
-    pub payload: Payload,
-    /// Requests per direction per cycle.
-    pub requests: u32,
+    /// Length of each direction's sustained phase per cycle.
+    pub sustain: Duration,
     /// Time between two idle latency probes.
     pub latency_interval: Duration,
     /// UDP loss probes per second.
@@ -111,11 +101,10 @@ pub struct ContinuousConfig {
 impl Default for ContinuousConfig {
     fn default() -> Self {
         // Modest by default: on a 150/90 Mbps line this moves about
-        // 0.25 GB of throughput data per hour.
+        // 0.6 GB of throughput data per hour.
         ContinuousConfig {
             cycle_interval: Duration::from_secs(900),
-            payload: Payload::Auto,
-            requests: 2,
+            sustain: Duration::from_secs(5),
             latency_interval: Duration::from_secs(1),
             loss_rate_hz: 5.0,
         }
@@ -125,6 +114,8 @@ impl Default for ContinuousConfig {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Config {
     pub family: IpFamily,
+    /// Parallel connections in a sustained transfer.
+    pub streams: u32,
     pub continuous: ContinuousConfig,
 }
 
@@ -132,6 +123,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             family: IpFamily::Auto,
+            streams: 4,
             continuous: ContinuousConfig::default(),
         }
     }
@@ -155,11 +147,12 @@ pub enum Phase {
         done: u32,
         total: u32,
     },
-    Transfer {
+    /// A sustained transfer started at `started` and lasting `length`.
+    Sustained {
         dir: Direction,
-        size: u64,
-        index: u32,
-        count: u32,
+        streams: u32,
+        started: Secs,
+        length: Secs,
     },
     PacketLoss {
         sent: u32,
@@ -258,12 +251,15 @@ pub struct RequestRecord {
     pub conn: u32,
     /// True when this request opened its connection.
     pub new_conn: bool,
+    /// The sustained transfer this request was one stream of; its bytes
+    /// are binned with the other streams' under that id.
+    pub sustained: Option<u32>,
     pub dir: Direction,
     /// Requested payload size.
     pub size: u64,
     /// Body bytes actually transferred.
     pub bytes: u64,
-    /// 1-based position within its set of same-size requests.
+    /// The stream it ran on (1-based) and the number of streams.
     pub index: u32,
     pub count: u32,
     pub t_start: Secs,
@@ -283,6 +279,30 @@ pub struct RequestRecord {
     pub client_tcp: Option<TcpStats>,
 }
 
+/// A sustained transfer: several connections kept busy with back-to-back
+/// requests in one direction for a fixed time. Its throughput bins carry
+/// its `id` and sum every stream.
+#[derive(Clone, Debug)]
+pub struct SustainedRecord {
+    pub id: u32,
+    pub dir: Direction,
+    pub streams: u32,
+    pub t_start: Secs,
+    pub t_end: Secs,
+    /// Bytes across all streams (download: body bytes received; upload:
+    /// bytes the server acknowledged).
+    pub bytes: u64,
+    /// Start of the steady part the throughput is computed over, after
+    /// the connections have ramped up.
+    pub t_steady: Secs,
+    pub steady_bytes: u64,
+    pub bps: Option<f64>,
+    /// HTTP requests across all streams.
+    pub requests: u32,
+    /// False when it ended early (error, rate limit, stop).
+    pub complete: bool,
+}
+
 /// Throughput over one short bin inside a request.
 #[derive(Clone, Copy, Debug)]
 pub struct ThroughputSample {
@@ -292,6 +312,7 @@ pub struct ThroughputSample {
     pub dt: f32,
     pub bps: f64,
     pub dir: Direction,
+    /// The request, or the sustained transfer, the bin belongs to.
     pub request: u32,
     /// 0-based bin number within the request.
     pub bin: u32,
@@ -438,6 +459,7 @@ pub enum Event {
     WifiSample(WifiSample),
     Conn(ConnRecord),
     Request(RequestRecord),
+    Sustained(SustainedRecord),
     Throughput(ThroughputSample),
     Latency(LatencySample),
     Loss(LossProbe),

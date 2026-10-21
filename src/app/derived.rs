@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use super::session::{LossCounts, RunState, Session, dir_idx};
-use crate::model::{Direction, Load, ProbeOutcome, RunMode};
+use crate::model::{Direction, Load, ProbeOutcome, RunMode, SustainedRecord};
 use crate::stats::{LogHistogram, Summary, jitter, summarize, summarize_iter};
 
 /// Exact order statistics up to this many samples; beyond it, the all-run
@@ -63,7 +63,12 @@ pub struct Derived {
     pub jitter: Headline,
     pub loss: Headline,
     pub loss_basis: LossCounts,
+    /// Requests that ran on their own (not as a stream), by payload size.
     pub sizes: [Vec<SizeGroup>; 2],
+    /// Per direction: throughput of every sustained transfer, and of the
+    /// 50 ms bins in their steady parts.
+    pub sustained: [Option<Summary>; 2],
+    pub sustained_bins: [Option<Summary>; 2],
     /// Median time to first byte per direction, over every request.
     pub ttfb_median: [Option<f64>; 2],
     pub lat_by_load: [Stat; 3],
@@ -134,6 +139,17 @@ fn from_hist(h: &LogHistogram) -> Option<Summary> {
     })
 }
 
+/// The 50 ms bins of sustained transfer `r` after its ramp-up.
+fn steady_bins<'a>(s: &'a Session, r: &'a SustainedRecord) -> impl Iterator<Item = f64> + 'a {
+    let series = &s.throughput[dir_idx(r.dir)];
+    let (a, b) = series.raw_range(r.t_steady, r.t_end + 1e-6);
+    series
+        .raw
+        .range(a, b)
+        .filter(move |x| x.request == r.id && x.t > r.t_steady)
+        .map(|x| x.bps)
+}
+
 fn compute(s: &Session, scratch: &mut Vec<f64>) -> Derived {
     let mut d = Derived {
         version: s.version,
@@ -145,7 +161,7 @@ fn compute(s: &Session, scratch: &mut Vec<f64>) -> Derived {
     // Throughput per direction and size.
     for dir in [Direction::Download, Direction::Upload] {
         let mut groups: BTreeMap<u64, (Vec<f64>, usize)> = BTreeMap::new();
-        for r in s.requests_in(dir) {
+        for r in s.single_requests().filter(|r| r.dir == dir) {
             let g = groups.entry(r.size).or_default();
             if !r.complete {
                 g.1 += 1;
@@ -171,12 +187,54 @@ fn compute(s: &Session, scratch: &mut Vec<f64>) -> Derived {
         )
         .map(|t| t.median);
 
+        let i = dir_idx(dir);
+        d.sustained[i] = summarize_iter(
+            scratch,
+            s.sustained
+                .iter()
+                .filter(|r| r.dir == dir)
+                .filter_map(|r| r.bps),
+        );
+        d.sustained_bins[i] = summarize_iter(
+            scratch,
+            s.sustained
+                .iter()
+                .filter(|r| r.dir == dir)
+                .flat_map(|r| steady_bins(s, r)),
+        );
+        // A sustained transfer, when there is one: the latest.
+        if let Some(r) = s
+            .sustained
+            .iter()
+            .rev()
+            .find(|r| r.dir == dir && r.bps.is_some())
+        {
+            let summary = summarize_iter(scratch, steady_bins(s, r));
+            let h = Headline {
+                value: r.bps,
+                summary,
+                basis: format!(
+                    "Bytes over time in the last {:.0} s of a {:.0} s {} on {} parallel connections; the first {:.0} s, while TCP ramps up, are left out. Statistics are of its 50 ms bins.",
+                    r.t_end - r.t_steady,
+                    r.t_end - r.t_start,
+                    dir.lower(),
+                    r.streams,
+                    r.t_steady - r.t_start,
+                ),
+            };
+            match dir {
+                Direction::Download => d.download = h,
+                Direction::Upload => d.upload = h,
+            }
+            continue;
+        }
         let usable =
             |r: &&crate::model::RequestRecord| r.duration_ms >= MIN_REQUEST_MS && r.bps.is_some();
+        let n = 2;
         let (summary, basis) = if continuous {
-            let n = s.config.continuous.requests.max(1) as usize;
             let recent: Vec<f64> = s
-                .requests_in(dir)
+                .single_requests()
+                .filter(|r| r.dir == dir)
                 .rev()
                 .filter(usable)
                 .take(n)
@@ -192,7 +250,10 @@ fn compute(s: &Session, scratch: &mut Vec<f64>) -> Derived {
             (
                 summarize_iter(
                     scratch,
-                    s.requests_in(dir).filter(usable).filter_map(|r| r.bps),
+                    s.single_requests()
+                        .filter(|r| r.dir == dir)
+                        .filter(usable)
+                        .filter_map(|r| r.bps),
                 ),
                 format!(
                     "90th percentile of all {} requests lasting at least {MIN_REQUEST_MS:.0} ms",

@@ -48,8 +48,11 @@ machines yet; `RST_EGUI=1` starts the previous cross-platform interface.
 - **Latency:** time to first byte of `GET /__down?bytes=0` minus the server
   time the edge reports, unloaded and while downloading or uploading.
 - **Jitter:** mean absolute difference between consecutive latency probes.
-- **Download / upload:** per request, as Cloudflare's speed test computes it;
-  the headline is the 90th percentile of requests lasting at least 10 ms.
+- **Download / upload:** sustained transfers: several connections (4 by
+  default) kept busy with back-to-back requests for a fixed time, 10 s per
+  direction in a one-shot test. Throughput is the bytes moved on all
+  connections after the first 2 s (TCP ramp-up) divided by that time, and
+  is also plotted in 50 ms bins.
 - **Packet loss:** UDP STUN Binding requests to `stun.cloudflare.com:3478`
   without an answer within 3 s, unloaded and under load.
 - **Connection:** DNS, TCP connect and TLS handshake per connection; public

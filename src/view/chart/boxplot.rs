@@ -41,6 +41,10 @@ impl BoxId {
 #[derive(Clone, Copy)]
 enum Key {
     Size(u64),
+    /// Sustained transfers' throughput.
+    Transfers,
+    /// Their 50 ms bins after ramp-up.
+    Bins,
     Load(Load),
 }
 
@@ -122,15 +126,29 @@ pub fn rows(id: BoxId, d: &Derived) -> Vec<Row> {
             } else {
                 Direction::Upload
             };
-            d.sizes[dir_idx(dir)]
-                .iter()
-                .map(|g| Row {
+            let color = super::series::dir_color(dir);
+            let i = dir_idx(dir);
+            let sustained = [
+                ("Transfers", d.sustained[i], Key::Transfers),
+                ("50 ms bins", d.sustained_bins[i], Key::Bins),
+            ];
+            sustained
+                .into_iter()
+                .filter(|(_, sm, _)| sm.is_some())
+                .map(|(label, sm, key)| Row {
+                    label: label.to_owned(),
+                    summary: sm.map(|s| s.scaled(1e-6)),
+                    approx: false,
+                    color,
+                    key,
+                })
+                .chain(d.sizes[i].iter().map(|g| Row {
                     label: size_label(g.size),
                     summary: g.summary.map(|s| s.scaled(1e-6)),
                     approx: false,
-                    color: super::series::dir_color(dir),
+                    color,
                     key: Key::Size(g.size),
-                })
+                }))
                 .collect()
         }
         BoxId::Latency => by_load(&d.lat_by_load, Color::Latency),
@@ -152,7 +170,10 @@ pub fn shown(id: BoxId, d: &Derived) -> bool {
 /// Changes whenever the samples behind box plot `id` are added or evicted.
 pub fn data_key(id: BoxId, s: &Session) -> [u64; 2] {
     let (n, evicted) = match id {
-        BoxId::Download | BoxId::Upload => (s.requests.len(), s.requests.evicted()),
+        BoxId::Download | BoxId::Upload => (
+            s.requests.len() + s.sustained.len(),
+            s.requests.evicted() + s.sustained.evicted(),
+        ),
         BoxId::Latency => (s.latency.raw.len(), s.latency.raw.evicted()),
         BoxId::Gateway => (s.gateway.raw.len(), s.gateway.raw.evicted()),
         BoxId::Udp => (s.loss.raw.len(), s.loss.raw.evicted()),
@@ -167,6 +188,14 @@ pub fn height(rows: usize) -> f32 {
     rows.max(1) as f32 * palette::BOX_ROW + palette::AXIS_HEIGHT
 }
 
+fn box_dir(id: BoxId) -> Direction {
+    if id == BoxId::Upload {
+        Direction::Upload
+    } else {
+        Direction::Download
+    }
+}
+
 /// Calls `f(value, payload index)` for every point of a row.
 fn for_points(id: BoxId, s: &Session, key: Key, mut f: impl FnMut(f64, usize)) {
     match (id, key) {
@@ -179,9 +208,35 @@ fn for_points(id: BoxId, s: &Session, key: Key, mut f: impl FnMut(f64, usize)) {
             for (i, r) in s.requests.iter().enumerate() {
                 if r.dir == dir
                     && r.size == size
+                    && r.sustained.is_none()
                     && let Some(b) = r.bps
                 {
                     f(b / 1e6, i);
+                }
+            }
+        }
+        (BoxId::Download | BoxId::Upload, Key::Transfers) => {
+            let dir = box_dir(id);
+            for (i, r) in s.sustained.iter().enumerate() {
+                if r.dir == dir
+                    && let Some(b) = r.bps
+                {
+                    f(b / 1e6, i);
+                }
+            }
+        }
+        (BoxId::Download | BoxId::Upload, Key::Bins) => {
+            let dir = box_dir(id);
+            let series = &s.throughput[dir_idx(dir)];
+            for r in s.sustained.iter().filter(|r| r.dir == dir) {
+                let (a, b) = series.raw_range(r.t_steady, r.t_end + 1e-6);
+                for j in a..b {
+                    if let Some(x) = series.raw.get(j)
+                        && x.request == r.id
+                        && x.t > r.t_steady
+                    {
+                        f(x.bps / 1e6, j);
+                    }
                 }
             }
         }
@@ -215,10 +270,37 @@ fn for_points(id: BoxId, s: &Session, key: Key, mut f: impl FnMut(f64, usize)) {
     }
 }
 
-fn point_tip(id: BoxId, s: &Session, idx: usize) -> Tip {
+fn point_tip(id: BoxId, s: &Session, key: Key, idx: usize) -> Tip {
     let clock = |t: f64| s.wall_at(t).map(|w| format::clock(w, true));
-    match id {
-        BoxId::Download | BoxId::Upload => {
+    match (id, key) {
+        (BoxId::Download | BoxId::Upload, Key::Transfers) => {
+            let Some(r) = s.sustained.get(idx) else {
+                return Tip::default();
+            };
+            let mut t =
+                Tip::default().title(format!("{} · {} connections", r.dir.label(), r.streams));
+            if let Some(b) = r.bps {
+                t.push_pair("Throughput", format!("{} Mbps", format::mbps(b)));
+            }
+            t.push_pair("Length", format!("{} s", format::sig3(r.t_end - r.t_start)));
+            if let Some(w) = clock(r.t_start) {
+                t.push_pair("Start", w);
+            }
+            t.note("Bytes on every connection after the TCP ramp-up, over that time.")
+        }
+        (BoxId::Download | BoxId::Upload, Key::Bins) => {
+            let Some(x) = s.throughput[dir_idx(box_dir(id))].raw.get(idx) else {
+                return Tip::default();
+            };
+            let mut t = Tip::default().title(format!("{} · 50 ms bin", x.dir.label()));
+            t.push_pair("Throughput", format!("{} Mbps", format::mbps(x.bps)));
+            t.push_pair("Bin", format!("{:.0} ms", f64::from(x.dt) * 1000.0));
+            if let Some(w) = clock(x.t) {
+                t.push_pair("Time", w);
+            }
+            t.note("Bytes on every connection in the bin, divided by its length.")
+        }
+        (BoxId::Download | BoxId::Upload, _) => {
             let Some(r) = s.requests.get(idx) else {
                 return Tip::default();
             };
@@ -254,7 +336,7 @@ fn point_tip(id: BoxId, s: &Session, idx: usize) -> Tip {
             }
             t
         }
-        BoxId::Latency => {
+        (BoxId::Latency, _) => {
             let Some(x) = s.latency.raw.get(idx) else {
                 return Tip::default();
             };
@@ -273,7 +355,7 @@ fn point_tip(id: BoxId, s: &Session, idx: usize) -> Tip {
             }
             t
         }
-        BoxId::Gateway => {
+        (BoxId::Gateway, _) => {
             let Some(g) = s.gateway.raw.get(idx) else {
                 return Tip::default();
             };
@@ -287,7 +369,7 @@ fn point_tip(id: BoxId, s: &Session, idx: usize) -> Tip {
             }
             t
         }
-        BoxId::Udp => {
+        (BoxId::Udp, _) => {
             let Some(p) = s.loss.raw.get(idx) else {
                 return Tip::default();
             };
@@ -525,7 +607,7 @@ pub fn hover(id: BoxId, s: &Session, d: &Derived, w: f32, h: f32, hp: Point) -> 
         Hover {
             crosshair: None,
             highlight: Some((p, row.color)),
-            tip: Some(point_tip(id, s, idx)),
+            tip: Some(point_tip(id, s, row.key, idx)),
             anchor: p,
         }
     } else if hp.x >= l.tf.x(st.min) - 2.0 && hp.x <= l.tf.x(st.max) + 2.0 {

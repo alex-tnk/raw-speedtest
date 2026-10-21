@@ -1,7 +1,6 @@
 use std::time::Instant;
 
-use super::download::Spec;
-use super::sampler::Binner;
+use super::download::{Sink, Spec};
 use super::{RunCtx, ms};
 use crate::model::{Direction, RequestRecord};
 use crate::net::cloudflare;
@@ -12,21 +11,22 @@ use crate::platform;
 ///
 /// Throughput follows Cloudflare's definition: `bits / (request start to
 /// first response byte)`; the edge answers only after it has the whole
-/// body. Fine-grained samples use bytes the peer has acknowledged (kernel
-/// TCP counters), not bytes handed to the socket buffer, so they don't
-/// show the buffer filling as a burst.
+/// body. Progress counts bytes the peer has acknowledged (kernel TCP
+/// counters), not bytes handed to the socket buffer, so the buffer
+/// filling doesn't show as a burst.
 pub fn run(
     ctx: &RunCtx,
     conn: &mut Conn,
     conn_id: u32,
     new_conn: bool,
     spec: &Spec,
+    sink: Sink<'_>,
 ) -> Result<RequestRecord, NetError> {
     let id = ctx.id();
     let plat = platform::current();
     let acked_base = plat.tcp_stats(conn.socket()).and_then(|s| s.bytes_acked);
     let start = Instant::now();
-    let mut binner = Binner::new(ctx, Direction::Upload, id, Some(start));
+    let mut prev = 0;
     let mut written = 0u64;
     let mut acked: Option<u64> = None;
     let deadline = Some(start + spec.limit);
@@ -35,7 +35,7 @@ pub fn run(
         spec.size,
         &|| ctx.interrupted(),
         deadline,
-        &mut |t, w, sock| {
+        &mut |_, w, sock| {
             written = w;
             let stats = plat.tcp_stats(sock);
             let a = stats.and_then(|s| match (acked_base, s.bytes_acked, s.send_queue_bytes) {
@@ -46,7 +46,7 @@ pub fn run(
             if let Some(a) = a {
                 let a = acked.map_or(a, |prev| prev.max(a));
                 acked = Some(a);
-                binner.add(t, a);
+                sink.progress(&mut prev, a);
             }
         },
     )?;
@@ -54,7 +54,7 @@ pub fn run(
     let rec = match r {
         Ok(ex) => {
             if acked.is_some() {
-                binner.finish(ex.t_first_byte, written);
+                sink.progress(&mut prev, written);
             }
             let ttfb_ms = ms(ex.t_first_byte - ex.t_start);
             let duration_ms = ttfb_ms;
@@ -62,6 +62,7 @@ pub fn run(
                 id,
                 conn: conn_id,
                 new_conn,
+                sustained: Some(sink.sustained),
                 dir: Direction::Upload,
                 size: spec.size,
                 bytes: spec.size,
@@ -82,13 +83,14 @@ pub fn run(
         Err(t_cut) => {
             // Time limit hit mid-body: rate from acknowledged bytes only.
             if let Some(a) = acked {
-                binner.finish(t_cut, a);
+                sink.progress(&mut prev, a);
             }
             let dur = ms(t_cut - start);
             RequestRecord {
                 id,
                 conn: conn_id,
                 new_conn,
+                sustained: Some(sink.sustained),
                 dir: Direction::Upload,
                 size: spec.size,
                 bytes: acked.unwrap_or(0),

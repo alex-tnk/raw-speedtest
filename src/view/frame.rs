@@ -11,8 +11,7 @@ use super::palette::{Color, GATEWAY};
 use super::tip::Tip;
 use crate::app::derived::{Derived, Headline as Stat, Retrans};
 use crate::app::session::{RunState, Session, dir_idx};
-use crate::engine::size_label;
-use crate::model::{Config, Direction, IpFamily, Load, Payload, Phase, RunMode, Sourced};
+use crate::model::{Config, Direction, IpFamily, Load, Phase, RunMode, Sourced};
 use crate::net::cloudflare;
 
 /// Before a value is measured.
@@ -155,8 +154,8 @@ pub struct Legends {
 #[repr(u8)]
 pub enum Setting {
     Interval = 0,
-    Payload = 1,
-    Requests = 2,
+    Sustain = 1,
+    Streams = 2,
     LatencyInterval = 3,
     UdpProbes = 4,
     IpVersion = 5,
@@ -165,8 +164,8 @@ pub enum Setting {
 impl Setting {
     pub const ALL: [Setting; 6] = [
         Setting::Interval,
-        Setting::Payload,
-        Setting::Requests,
+        Setting::Sustain,
+        Setting::Streams,
         Setting::LatencyInterval,
         Setting::UdpProbes,
         Setting::IpVersion,
@@ -181,8 +180,8 @@ impl Setting {
     pub fn label(self) -> &'static str {
         match self {
             Setting::Interval => "Throughput every",
-            Setting::Payload => "Payload",
-            Setting::Requests => "Requests per cycle",
+            Setting::Sustain => "Transfer for",
+            Setting::Streams => "Connections",
             Setting::LatencyInterval => "Latency probe every",
             Setting::UdpProbes => "UDP probes",
             Setting::IpVersion => "IP version",
@@ -193,8 +192,8 @@ impl Setting {
         let s = |v: &[&str]| v.iter().map(|x| (*x).to_owned()).collect();
         match self {
             Setting::Interval => s(&INTERVALS.map(|x| x.1)),
-            Setting::Payload => s(&PAYLOADS.map(|x| x.1)),
-            Setting::Requests => REQUESTS.iter().map(u32::to_string).collect(),
+            Setting::Sustain => s(&SUSTAIN.map(|x| x.1)),
+            Setting::Streams => STREAMS.iter().map(u32::to_string).collect(),
             Setting::LatencyInterval => s(&LATENCY_MS.map(|x| x.1)),
             Setting::UdpProbes => s(&LOSS_HZ.map(|x| x.1)),
             Setting::IpVersion => s(&FAMILIES.map(|f| f.label())),
@@ -209,11 +208,11 @@ impl Setting {
                 .iter()
                 .position(|(s, _)| Duration::from_secs(*s) == c.cycle_interval)
                 .unwrap_or(4),
-            Setting::Payload => PAYLOADS
+            Setting::Sustain => SUSTAIN
                 .iter()
-                .position(|(p, _)| *p == c.payload)
-                .unwrap_or(0),
-            Setting::Requests => REQUESTS.iter().position(|r| *r == c.requests).unwrap_or(1),
+                .position(|(secs, _)| Duration::from_secs(*secs) == c.sustain)
+                .unwrap_or(1),
+            Setting::Streams => STREAMS.iter().position(|n| *n == cfg.streams).unwrap_or(2),
             Setting::LatencyInterval => LATENCY_MS
                 .iter()
                 .position(|(ms, _)| Duration::from_millis(*ms) == c.latency_interval)
@@ -232,8 +231,8 @@ impl Setting {
         let c = &mut out.continuous;
         match self {
             Setting::Interval => c.cycle_interval = Duration::from_secs(INTERVALS.get(i)?.0),
-            Setting::Payload => c.payload = PAYLOADS.get(i)?.0,
-            Setting::Requests => c.requests = *REQUESTS.get(i)?,
+            Setting::Sustain => c.sustain = Duration::from_secs(SUSTAIN.get(i)?.0),
+            Setting::Streams => out.streams = *STREAMS.get(i)?,
             Setting::LatencyInterval => {
                 c.latency_interval = Duration::from_millis(LATENCY_MS.get(i)?.0)
             }
@@ -253,13 +252,8 @@ const INTERVALS: [(u64, &str); 7] = [
     (1800, "30 min"),
     (3600, "60 min"),
 ];
-const PAYLOADS: [(Payload, &str); 4] = [
-    (Payload::Auto, "Auto"),
-    (Payload::Bytes(1_000_000), "1 MB"),
-    (Payload::Bytes(10_000_000), "10 MB"),
-    (Payload::Bytes(25_000_000), "25 MB"),
-];
-const REQUESTS: [u32; 4] = [1, 2, 3, 5];
+const SUSTAIN: [(u64, &str); 4] = [(2, "2 s"), (5, "5 s"), (10, "10 s"), (15, "15 s")];
+const STREAMS: [u32; 4] = [1, 2, 4, 8];
 const LATENCY_MS: [(u64, &str); 5] = [
     (500, "0.5 s"),
     (1000, "1 s"),
@@ -303,12 +297,8 @@ fn settings(cfg: &Config, d: &Derived) -> Settings {
         })
         .collect();
     let c = &cfg.continuous;
-    let size = |rate: Option<f64>| match c.payload {
-        Payload::Bytes(b) => Some(b as f64),
-        Payload::Auto => rate.map(|bps| (bps / 8.0).clamp(100e3, 25e6)),
-    };
-    let per_cycle = match (size(d.download.value), size(d.upload.value)) {
-        (Some(a), Some(b)) => Some((a + b) * f64::from(c.requests)),
+    let per_cycle = match (d.download.value, d.upload.value) {
+        (Some(a), Some(b)) => Some((a + b) / 8.0 * c.sustain.as_secs_f64()),
         _ => None,
     };
     let per_hour = per_cycle.map(|b| b * 3600.0 / c.cycle_interval.as_secs_f64());
@@ -324,9 +314,8 @@ fn settings(cfg: &Config, d: &Derived) -> Settings {
         data_per_hour: Kv {
             label: "Throughput data per hour".into(),
             value,
-            tip: Tip::default().note(
-                "Payload × requests × 2 directions × cycles per hour. Auto payloads are sized for one second at the last measured rate.",
-            ),
+            tip: Tip::default()
+                .note("Last measured download and upload rates × transfer time × cycles per hour."),
         },
     }
 }
@@ -366,13 +355,18 @@ pub fn status(s: &Session, notice: Option<(&str, bool)>) -> Status {
                 format!("Measuring latency · {done}/{total} probes"),
                 Color::Text,
             ),
-            Some(Phase::Transfer {
+            Some(Phase::Sustained {
                 dir,
-                size,
-                index,
-                count,
+                streams,
+                started,
+                length,
             }) => st(
-                format!("{} {} · {index}/{count}", dir.label(), size_label(*size)),
+                format!(
+                    "{} · {streams} connections · {:.0} of {:.0} s",
+                    dir.label(),
+                    (now - started).clamp(0.0, *length).floor(),
+                    length
+                ),
                 Color::Text,
             ),
             Some(Phase::PacketLoss { sent, total }) => st(
@@ -402,6 +396,12 @@ fn progress(s: &Session) -> Option<f32> {
         (Some(RunMode::OneShot), RunState::Running | RunState::Paused) => Some(s.progress),
         (Some(RunMode::OneShot), RunState::Finished) => Some(1.0),
         (Some(RunMode::Continuous), RunState::Running | RunState::Paused) => match &s.phase {
+            Some(Phase::Sustained {
+                started, length, ..
+            }) => {
+                let now = s.now().unwrap_or(0.0);
+                Some(((now - started) / length.max(1e-3)).clamp(0.0, 1.0) as f32)
+            }
             Some(Phase::Waiting { next_cycle_at }) => {
                 let iv = s.config.continuous.cycle_interval.as_secs_f64().max(1.0);
                 let now = s.now().unwrap_or(0.0);
@@ -544,13 +544,23 @@ fn throughput_column(d: &Derived, dir: Direction) -> Column {
         },
         d,
     )];
+    let transfers = d.sustained[dir_idx(dir)].map_or(0, |s| s.n);
+    if transfers > 0 {
+        items.push(Item::Kv(kv(
+            "Transfers",
+            Some(format::count(transfers as u64)),
+            "Sustained transfers: every connection kept busy with back-to-back requests for a fixed time.",
+        )));
+    }
     let all: usize = groups.iter().filter_map(|g| g.summary.map(|s| s.n)).sum();
     let incomplete: usize = groups.iter().map(|g| g.incomplete).sum();
-    items.push(Item::Kv(kv(
-        "Requests",
-        (all > 0).then(|| format::count(all as u64)),
-        "Requests with a throughput value.",
-    )));
+    if all > 0 || transfers == 0 {
+        items.push(Item::Kv(kv(
+            "Requests",
+            (all > 0).then(|| format::count(all as u64)),
+            "Requests run on their own, with a throughput value.",
+        )));
+    }
     if incomplete > 0 {
         items.push(Item::Kv(kv(
             "Cut at time limit",

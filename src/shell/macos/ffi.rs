@@ -245,13 +245,16 @@ pub extern "C" fn rst_chart(
     let Some(id) = chart_id(kind, index) else {
         return false;
     };
-    let sc = c.core.scene(id, w.max(1.0), h.max(1.0), label_h.max(1.0));
+    // One build: the commands, points and text below all come from it. A
+    // second call could rebuild the scene in between (new data arrived)
+    // and pair commands with another scene's points.
+    let (sc, generation) = c
+        .core
+        .scene_gen(id, w.max(1.0), h.max(1.0), label_h.max(1.0));
     let (plot, pts, text) = (sc.plot, sc.pts.as_ptr(), (sc.text.as_ptr(), sc.text.len()));
     let n_pts = sc.pts.len();
-    let generation = c.core.scene_generation(id);
     let entry = c.cmds.entry(id).or_insert_with(|| (u64::MAX, Vec::new()));
     if entry.0 != generation {
-        let sc = c.core.scene(id, w.max(1.0), h.max(1.0), label_h.max(1.0));
         entry.1.clear();
         entry.1.extend(sc.prims.iter().map(encode));
         entry.0 = generation;

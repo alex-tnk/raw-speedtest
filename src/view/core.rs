@@ -215,7 +215,15 @@ impl Core {
 
     /// The scene of chart `id` at `w`×`h` points; `label_h` is the height
     /// of a small text line, used to keep percentile labels apart.
+    // Not every shell uses every part of the view layer.
+    #[allow(dead_code)]
     pub fn scene(&mut self, id: ChartId, w: f32, h: f32, label_h: f32) -> &Scene {
+        self.scene_gen(id, w, h, label_h).0
+    }
+
+    /// `scene`, with the generation of the scene it returns (bumped each
+    /// time the scene is rebuilt).
+    pub fn scene_gen(&mut self, id: ChartId, w: f32, h: f32, label_h: f32) -> (&Scene, u64) {
         let Core {
             ctl,
             cache,
@@ -270,15 +278,7 @@ impl Core {
             entry.0 = key;
             entry.2 += 1;
         }
-        &entry.1
-    }
-
-    /// Bumped each time the scene of `id` is rebuilt, so a shell can keep
-    /// its own drawing objects until then. 0 before the first build.
-    // Not every shell uses every part of the view layer.
-    #[allow(dead_code)]
-    pub fn scene_generation(&self, id: ChartId) -> u64 {
-        self.scenes.get(&id).map_or(0, |e| e.2)
+        (&entry.1, entry.2)
     }
 
     /// What hovering chart `id` at chart-local `(x, y)` shows.
@@ -569,9 +569,9 @@ mod tests {
     }
 
     /// Hours into a run, rare latency spikes don't set the axis, and each
-    /// throughput request is one point rather than a sliver of bins.
+    /// throughput transfer is one point rather than a sliver of bins.
     #[test]
-    fn long_runs_cut_spikes_and_draw_requests_as_points() {
+    fn long_runs_cut_spikes_and_draw_transfers_as_points() {
         let mut core = core_with(3.0 * 3600.0);
         let lat = core.scene(ChartId::Latency, W, 148.0, 13.0).clone();
         assert!(
@@ -588,11 +588,12 @@ mod tests {
                 _ => None,
             })
             .sum();
-        let n = core.with_session(|s| s.requests.iter().filter(|r| r.bps.is_some()).count());
+        let n = core.with_session(|s| s.sustained.iter().filter(|r| r.bps.is_some()).count());
         assert!(n > 0);
         assert_eq!(dots, n);
         // Zoomed in on one cycle, the bins are back.
-        let (t, end) = core.with_session(|s| (s.requests.get(0).map_or(0.0, |r| r.t_end), s.now()));
+        let (t, end) =
+            core.with_session(|s| (s.sustained.get(0).map_or(0.0, |r| r.t_end), s.now()));
         let plot = time_plot(W, 1.0);
         let x = plot.x0 + (t / end.unwrap_or(1.0)) as f32 * plot.width();
         core.zoom(3.0 * 3600.0 / 20.0, x, W);

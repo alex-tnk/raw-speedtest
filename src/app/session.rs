@@ -5,7 +5,7 @@ use std::time::{Instant, SystemTime};
 use crate::model::{
     Config, ConnRecord, Direction, EdgeInfo, Event, GatewaySample, HostInfo, InterfaceInfo,
     LatencySample, Load, LossProbe, Phase, ProbeOutcome, RequestRecord, RunMode, Secs,
-    ThroughputSample, WifiInfo, WifiSample,
+    SustainedRecord, ThroughputSample, WifiInfo, WifiSample,
 };
 use crate::stats::{LogHistogram, Ring, Sample, Series};
 
@@ -145,6 +145,8 @@ pub struct Session {
     pub wifi: Option<Option<WifiInfo>>,
     pub conns: Ring<ConnRecord>,
     pub requests: Ring<RequestRecord>,
+    /// Sustained transfers; their streams' requests are in `requests`.
+    pub sustained: Ring<SustainedRecord>,
     /// Fine-grained bins, download and upload.
     pub throughput: [Series<ThroughputSample>; 2],
     pub latency: Series<LatencySample>,
@@ -188,6 +190,7 @@ impl Session {
             wifi: None,
             conns: Ring::new(RAW_CONNS),
             requests: Ring::new(RAW_REQUESTS),
+            sustained: Ring::new(RAW_REQUESTS),
             throughput: [Series::new(RAW_THROUGHPUT), Series::new(RAW_THROUGHPUT)],
             latency: Series::new(RAW_LATENCY),
             latency_hist: Default::default(),
@@ -219,6 +222,7 @@ impl Session {
         self.wifi = None;
         self.conns.clear();
         self.requests.clear();
+        self.sustained.clear();
         for t in &mut self.throughput {
             t.clear();
         }
@@ -280,6 +284,9 @@ impl Session {
             }
             Event::Request(r) => {
                 self.requests.push(r);
+            }
+            Event::Sustained(r) => {
+                self.sustained.push(r);
             }
             Event::Throughput(s) => self.throughput[dir_idx(s.dir)].push(s),
             Event::Latency(s) => {
@@ -347,8 +354,53 @@ impl Session {
 
     /// The request with `id`; ids increase with start time.
     pub fn request(&self, id: u32) -> Option<&RequestRecord> {
+        // Parallel streams finish out of id order, so look around the
+        // binary search's answer.
         let i = self.requests.partition_point(|r| r.id < id);
-        self.requests.get(i).filter(|r| r.id == id)
+        let near = i.saturating_sub(64)..(i + 64).min(self.requests.len());
+        near.filter_map(|j| self.requests.get(j))
+            .find(|r| r.id == id)
+    }
+
+    pub fn sustained(&self, id: u32) -> Option<&SustainedRecord> {
+        let i = self.sustained.partition_point(|r| r.id < id);
+        self.sustained.get(i).filter(|r| r.id == id)
+    }
+
+    /// The transfer whose bins carry `id`.
+    pub fn transfer(&self, id: u32) -> Option<Transfer<'_>> {
+        self.sustained(id).map(Transfer::Sustained).or_else(|| {
+            self.request(id)
+                .filter(|r| r.sustained.is_none())
+                .map(Transfer::Single)
+        })
+    }
+
+    /// Transfers overlapping `[t0, t1]` plus `margin` more on each side, in
+    /// start order.
+    pub fn transfers(&self, t0: Secs, t1: Secs, margin: usize) -> Transfers<'_> {
+        let range = |n: usize, a: usize, b: usize| (a.saturating_sub(margin), (b + margin).min(n));
+        let (sa, sb) = range(
+            self.sustained.len(),
+            self.sustained.partition_point(|r| r.t_end < t0),
+            self.sustained.partition_point(|r| r.t_start <= t1),
+        );
+        let (ra, rb) = range(
+            self.requests.len(),
+            self.requests.partition_point(|r| r.t_end < t0),
+            self.requests.partition_point(|r| r.t_start <= t1),
+        );
+        Transfers {
+            s: self,
+            sus: sa..sb,
+            req: ra..rb,
+        }
+    }
+
+    /// Requests that ran on their own, not as a stream of a sustained
+    /// transfer.
+    pub fn single_requests(&self) -> impl DoubleEndedIterator<Item = &RequestRecord> + Clone {
+        self.requests.iter().filter(|r| r.sustained.is_none())
     }
 
     pub fn requests_in(
@@ -356,6 +408,85 @@ impl Session {
         dir: Direction,
     ) -> impl DoubleEndedIterator<Item = &RequestRecord> + Clone {
         self.requests.iter().filter(move |r| r.dir == dir)
+    }
+}
+
+/// What the throughput charts plot as one unit: a sustained transfer (its
+/// streams' bytes summed), or a request that ran on its own. Its bins
+/// carry its id.
+#[derive(Clone, Copy, Debug)]
+pub enum Transfer<'a> {
+    Sustained(&'a SustainedRecord),
+    Single(&'a RequestRecord),
+}
+
+impl Transfer<'_> {
+    pub fn dir(&self) -> Direction {
+        match self {
+            Transfer::Sustained(r) => r.dir,
+            Transfer::Single(r) => r.dir,
+        }
+    }
+    pub fn t_start(&self) -> Secs {
+        match self {
+            Transfer::Sustained(r) => r.t_start,
+            Transfer::Single(r) => r.t_start,
+        }
+    }
+    pub fn t_end(&self) -> Secs {
+        match self {
+            Transfer::Sustained(r) => r.t_end,
+            Transfer::Single(r) => r.t_end,
+        }
+    }
+    pub fn bps(&self) -> Option<f64> {
+        match self {
+            Transfer::Sustained(r) => r.bps,
+            Transfer::Single(r) => r.bps,
+        }
+    }
+}
+
+/// Sustained transfers and single requests merged in start order.
+pub struct Transfers<'a> {
+    s: &'a Session,
+    sus: std::ops::Range<usize>,
+    req: std::ops::Range<usize>,
+}
+
+impl<'a> Iterator for Transfers<'a> {
+    type Item = Transfer<'a>;
+
+    fn next(&mut self) -> Option<Transfer<'a>> {
+        // Streams' requests are skipped: their sustained transfer stands
+        // for them.
+        while let Some(r) = self.s.requests.get(self.req.start) {
+            if self.req.is_empty() || r.sustained.is_none() {
+                break;
+            }
+            self.req.start += 1;
+        }
+        let sus = (!self.sus.is_empty())
+            .then(|| self.s.sustained.get(self.sus.start))
+            .flatten();
+        let req = (!self.req.is_empty())
+            .then(|| self.s.requests.get(self.req.start))
+            .flatten();
+        match (sus, req) {
+            (Some(a), Some(b)) if b.t_start < a.t_start => {
+                self.req.start += 1;
+                Some(Transfer::Single(b))
+            }
+            (Some(a), _) => {
+                self.sus.start += 1;
+                Some(Transfer::Sustained(a))
+            }
+            (None, Some(b)) => {
+                self.req.start += 1;
+                Some(Transfer::Single(b))
+            }
+            (None, None) => None,
+        }
     }
 }
 
@@ -425,49 +556,74 @@ pub fn synthetic(secs: f64) -> Session {
             }));
         }
         if t >= next_cycle {
-            // Three 1 s requests per direction, 20 bins each.
+            // A 5 s sustained transfer per direction on 4 connections:
+            // 100 summed bins, then each stream's request, then the record.
             let mut tc = t;
             for dir in [Direction::Download, Direction::Upload] {
-                for index in 1..=3u32 {
+                let sid = id;
+                id += 1;
+                let base = if dir == Direction::Download {
+                    300e6
+                } else {
+                    40e6
+                };
+                let mut bytes = 0.0;
+                let mut steady = 0.0;
+                for bin in 0..100u32 {
+                    let ramp = (f64::from(bin + 1) / 20.0).min(1.0);
+                    let bps = base * ramp * (0.85 + 0.3 * rnd());
+                    bytes += bps * 0.05 / 8.0;
+                    if bin >= 40 {
+                        steady += bps * 0.05 / 8.0;
+                    }
+                    s.apply(Event::Throughput(ThroughputSample {
+                        t: tc + f64::from(bin + 1) * 0.05,
+                        dt: 0.05,
+                        bps,
+                        dir,
+                        request: sid,
+                        bin,
+                    }));
+                }
+                for index in 1..=4u32 {
                     let rid = id;
                     id += 1;
-                    let base = if dir == Direction::Download {
-                        300e6
-                    } else {
-                        40e6
-                    };
-                    for bin in 0..20u32 {
-                        s.apply(Event::Throughput(ThroughputSample {
-                            t: tc + f64::from(bin + 1) * 0.05,
-                            dt: 0.05,
-                            bps: base * (0.7 + 0.6 * rnd()),
-                            dir,
-                            request: rid,
-                            bin,
-                        }));
-                    }
                     s.apply(Event::Request(RequestRecord {
                         id: rid,
-                        conn: 2,
-                        new_conn: index == 1,
+                        conn: 2 + index,
+                        new_conn: true,
+                        sustained: Some(sid),
                         dir,
-                        size: 25_000_000,
-                        bytes: 25_000_000,
+                        size: 99_999_999,
+                        bytes: (bytes / 4.0) as u64,
                         index,
-                        count: 3,
+                        count: 4,
                         t_start: tc,
-                        t_end: tc + 1.0,
+                        t_end: tc + 5.0,
                         ttfb_ms: 40.0,
-                        transfer_ms: 960.0,
+                        transfer_ms: 4960.0,
                         server_ms: Some(20.0),
-                        duration_ms: 980.0,
-                        bps: Some(base * (0.9 + 0.2 * rnd())),
-                        complete: true,
+                        duration_ms: 4980.0,
+                        bps: Some(base / 4.0),
+                        complete: false,
                         server_tcp: None,
                         client_tcp: None,
                     }));
-                    tc += 1.0;
                 }
+                s.apply(Event::Sustained(SustainedRecord {
+                    id: sid,
+                    dir,
+                    streams: 4,
+                    t_start: tc,
+                    t_end: tc + 5.0,
+                    bytes: bytes as u64,
+                    t_steady: tc + 2.0,
+                    steady_bytes: steady as u64,
+                    bps: Some(steady * 8.0 / 3.0),
+                    requests: 4,
+                    complete: true,
+                }));
+                tc += 5.0;
             }
             next_cycle += 300.0;
         }
@@ -479,6 +635,35 @@ pub fn synthetic(secs: f64) -> Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sustained transfers stand for their streams, and merge with single
+    /// requests in start order; the headline is the latest transfer's rate.
+    #[test]
+    fn transfers_merge_and_set_the_headline() {
+        let s = synthetic(1200.0);
+        let all: Vec<Transfer<'_>> = s.transfers(0.0, 1200.0, 0).collect();
+        assert_eq!(all.len(), s.sustained.len());
+        assert!(all.windows(2).all(|w| w[0].t_start() <= w[1].t_start()));
+        assert!(all.iter().all(|x| matches!(x, Transfer::Sustained(_))));
+        let last = s
+            .sustained
+            .iter()
+            .rev()
+            .find(|r| r.dir == Direction::Download)
+            .expect("a download transfer");
+        assert!(matches!(s.transfer(last.id), Some(Transfer::Sustained(r)) if r.id == last.id));
+        let stream = s
+            .requests
+            .iter()
+            .find(|r| r.sustained == Some(last.id))
+            .expect("its streams");
+        assert!(s.transfer(stream.id).is_none(), "a stream isn't a transfer");
+        let mut c = crate::app::derived::Cache::new();
+        c.update(&s);
+        assert_eq!(c.derived.download.value, last.bps);
+        let sm = c.derived.download.summary.expect("bin statistics");
+        assert_eq!(sm.n, 60, "bins after the 2 s ramp-up");
+    }
 
     fn probe(t: f64, outcome: ProbeOutcome) -> Event {
         Event::Loss(LossProbe {
