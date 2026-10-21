@@ -140,6 +140,34 @@ impl Transform {
     pub fn pos(&self, t: f64, v: f64) -> Point {
         pt(self.x(t), self.y(v))
     }
+    /// `y`, with values above the axis drawn on its top edge.
+    pub fn yc(&self, v: f64) -> f32 {
+        self.y(v.min(self.v1))
+    }
+    pub fn posc(&self, t: f64, v: f64) -> Point {
+        pt(self.x(t), self.yc(v))
+    }
+}
+
+/// Above this multiple of the robust top, rare spikes no longer set the
+/// value axis: it fits the 99th percentile with some headroom, taller
+/// samples are drawn on its top edge, and the gutter labels their maximum.
+const SPIKE_RATIO: f64 = 1.5;
+const ROBUST_HEADROOM: f64 = 1.25;
+/// With fewer visible samples the axis always fits the maximum.
+const ROBUST_MIN_SAMPLES: usize = 50;
+
+/// Top of a value axis for samples whose maximum is `max` and 99th
+/// percentile `p99` over `n` samples.
+pub fn robust_top(max: f64, p99: Option<f64>, n: usize) -> f64 {
+    match p99 {
+        Some(p)
+            if n >= ROBUST_MIN_SAMPLES && p > 0.0 && max > SPIKE_RATIO * p * ROBUST_HEADROOM =>
+        {
+            nice_max(p * ROBUST_HEADROOM)
+        }
+        _ => nice_max(max),
+    }
 }
 
 /// 1-2-2.5-5 steps: ticks covering `[lo, hi]`, at most about `max_ticks`.
@@ -464,6 +492,14 @@ mod tests {
         assert_eq!(v, vec![0.0, 20.0, 40.0, 60.0, 80.0, 100.0]);
         assert_eq!(nice_max(63.6), 80.0);
         assert_eq!(nice_max(95.0), 100.0);
+    }
+
+    #[test]
+    fn rare_spikes_dont_set_the_axis() {
+        assert_eq!(robust_top(220.0, Some(24.0), 1000), 40.0);
+        // Few samples, or a maximum near the bulk: fit the maximum.
+        assert_eq!(robust_top(220.0, Some(24.0), 10), 250.0);
+        assert_eq!(robust_top(40.0, Some(30.0), 1000), 50.0);
     }
 
     #[test]

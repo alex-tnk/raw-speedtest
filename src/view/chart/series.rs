@@ -3,12 +3,12 @@
 use std::time::{Duration, SystemTime};
 
 use super::{
-    Decimator, Hover, TimeView, Transform, nice_max, nice_ticks, percentile_labels, segments,
-    time_axis, time_plot, value_axis,
+    Decimator, Hover, TimeView, Transform, nice_max, nice_ticks, percentile_labels, robust_top,
+    segments, time_axis, time_plot, value_axis,
 };
 use crate::app::session::{RunState, Session};
 use crate::engine::size_label;
-use crate::model::{Direction, ProbeOutcome};
+use crate::model::{Direction, ProbeOutcome, RequestRecord};
 use crate::stats::{Bucket, Sample, Series as SampleSeries, Tier};
 use crate::view::format;
 use crate::view::palette::{self, Color, GATEWAY};
@@ -41,6 +41,29 @@ impl<T: Copy> Memo<T> {
 
 type Pct = Option<(f64, f64)>;
 
+/// What the latency chart's axis is computed from.
+#[derive(Clone, Copy, Default)]
+struct LatStats {
+    /// Highest latency or gateway sample in view.
+    max: f64,
+    /// Top of the value axis; below `max` when rare spikes are cut.
+    top: f64,
+    /// (p50, p90) of latency in view.
+    pct: Pct,
+}
+
+/// What the throughput chart's axis and mode are computed from.
+#[derive(Clone, Copy, Default)]
+struct TputStats {
+    /// Highest 50 ms bin and highest request throughput in view.
+    bins_max: f64,
+    req_max: f64,
+    /// Mean request duration in view, seconds.
+    mean_req_secs: f64,
+    /// Per direction, (p50, p90) of request throughput in view.
+    pct: [Pct; 2],
+}
+
 /// Axis maxima and percentiles are kept until the data or the view
 /// settings change. While following live data the range creeps forward
 /// with the clock between data updates; the statistics catch up at the next
@@ -56,16 +79,24 @@ fn stats_key(s: &Session, view: &TimeView) -> (u64, u64, u64) {
 /// Scratch buffers and per-view statistics for the time-series charts.
 #[derive(Default)]
 pub struct Charts {
-    /// Axis maximum and per-direction (p50, p90) for the view.
-    tput_stats: Memo<(f64, [Pct; 2])>,
+    tput_stats: Memo<TputStats>,
     /// Axis maximum and (p50, p90) of latency for the view.
-    lat_stats: Memo<(f64, Pct)>,
+    lat_stats: Memo<LatStats>,
+    cols: Vec<Col>,
     pts: Vec<Point>,
     /// Second point buffer for aggregates drawn while `pts` is in use.
     aux: Vec<Point>,
     breaks: Vec<usize>,
     ticks: Vec<f64>,
     vals: Vec<f64>,
+}
+
+fn dir_of(i: usize) -> Direction {
+    if i == 0 {
+        Direction::Download
+    } else {
+        Direction::Upload
+    }
 }
 
 pub fn dir_color(d: Direction) -> Color {
@@ -118,13 +149,13 @@ fn draw_buckets(
         if let Some(mean) = bk.mean() {
             let x = tf.x(bk.t0 + tier.width / 2.0);
             sc.segment(
-                pt(x, tf.y(bk.min)),
-                pt(x, tf.y(bk.max)),
+                pt(x, tf.yc(bk.min)),
+                pt(x, tf.yc(bk.max)),
                 palette::STROKE,
                 color,
                 palette::ENVELOPE_ALPHA,
             );
-            pts.push(pt(x, tf.y(mean)));
+            pts.push(pt(x, tf.yc(mean)));
         }
         i += 1;
     }
@@ -198,6 +229,315 @@ fn feed_buckets(dec: &mut Decimator<'_>, tier: &Tier, tf: &Transform) {
     }
 }
 
+/// Index range of the requests overlapping `[t0, t1]`, with a few of
+/// margin on each side so trend lines run to the plot edges.
+fn visible_requests(s: &Session, t0: f64, t1: f64) -> (usize, usize) {
+    let a = s.requests.partition_point(|r| r.t_end < t0);
+    let b = s.requests.partition_point(|r| r.t_start <= t1);
+    (a.saturating_sub(4), (b + 4).min(s.requests.len()))
+}
+
+/// Feeds `dec` a line through each set's median request throughput in
+/// direction `dir` (requests of one cycle run back to back) and puts every
+/// request's point in `dots`.
+fn request_trend(
+    dec: &mut Decimator<'_>,
+    dots: &mut Vec<Point>,
+    vals: &mut Vec<f64>,
+    s: &Session,
+    dir: Direction,
+    tf: &Transform,
+) {
+    let gap_limit = request_gap(s);
+    let (ra, rb) = visible_requests(s, tf.t0, tf.t1);
+    let mut prev: Option<f64> = None;
+    let mut set: Option<(f64, f64)> = None;
+    vals.clear();
+    let mut flush = |dec: &mut Decimator<'_>, vals: &mut Vec<f64>, set: (f64, f64)| {
+        if let Some(sm) = crate::stats::summarize(vals) {
+            let t = (set.0 + set.1) / 2.0;
+            if prev.is_some_and(|p| t - p > gap_limit) {
+                dec.gap();
+            }
+            dec.push(tf.pos(t, sm.median));
+            prev = Some(t);
+        }
+        vals.clear();
+    };
+    for r in s.requests.range(ra, rb).filter(|r| r.dir == dir) {
+        let Some(b) = r.bps else { continue };
+        match &mut set {
+            Some(st) if r.t_start - st.1 <= SET_GAP => st.1 = r.t_end,
+            _ => {
+                if let Some(st) = set {
+                    flush(dec, vals, st);
+                }
+                set = Some((r.t_start, r.t_end));
+            }
+        }
+        vals.push(b);
+        dots.push(tf.pos((r.t_start + r.t_end) / 2.0, b));
+    }
+    if let Some(st) = set {
+        flush(dec, vals, st);
+    }
+}
+
+/// How many bins a hover looks past on each side for one that is drawn.
+const BIN_SEARCH: usize = 256;
+
+/// Requests starting within this of the previous one's end belong to the
+/// same set (one continuous cycle, or one one-shot set).
+const SET_GAP: f64 = 10.0;
+
+/// Requests further apart than this aren't joined by the trend line:
+/// a few continuous cycles missed (stopped, paused, failing).
+fn request_gap(s: &Session) -> f64 {
+    (3.0 * s.config.continuous.cycle_interval.as_secs_f64()).max(120.0)
+}
+
+/// The request point nearest the pointer, when requests are drawn as
+/// points.
+/// Whether request `r` is too narrow at this zoom to show its bins.
+fn narrow_request(tf: &Transform, r: &RequestRecord) -> bool {
+    tf.x(r.t_end) - tf.x(r.t_start) < palette::REQUEST_MIN_WIDTH
+}
+
+/// The request point nearest the pointer among those `only` admits, with
+/// its distance score; `None` if none is near.
+fn request_hover(
+    inp: &Inputs<'_>,
+    tf: &Transform,
+    hp: Point,
+    only: impl Fn(&RequestRecord) -> bool,
+) -> Option<(Hover, f32)> {
+    let s = inp.s;
+    let (ra, rb) = visible_requests(s, tf.t0, tf.t1);
+    let near = s
+        .requests
+        .range(ra, rb)
+        .filter(|r| only(r))
+        .filter_map(|r| {
+            let p = tf.pos((r.t_start + r.t_end) / 2.0, r.bps?);
+            Some((r, p, (p.x - hp.x).abs() + 0.25 * (p.y - hp.y).abs()))
+        })
+        .min_by(|a, b| a.2.total_cmp(&b.2));
+    let (r, p, d) = near.filter(|(_, p, _)| (p.x - hp.x).abs() <= palette::SNAP_PX)?;
+    let mut tip = Tip::default().title(format!(
+        "{} {} · sample {}/{}",
+        size_label(r.size),
+        r.dir.lower(),
+        r.index,
+        r.count
+    ));
+    tip.push_pair(
+        "Throughput",
+        format!("{} Mbps", format::mbps(r.bps.unwrap_or(0.0))),
+    );
+    tip.push_pair("Start", wall(inp, r.t_start));
+    tip.push_pair("Duration", format!("{} ms", format::ms(r.duration_ms)));
+    tip.push_pair("TTFB", format!("{} ms", format::ms(r.ttfb_ms)));
+    let tip = tip.note(match r.dir {
+        Direction::Download => {
+            "One point per request: bits received over TTFB minus server time plus transfer time. Zoom in to see its 50 ms bins."
+        }
+        Direction::Upload => {
+            "One point per request: bits sent over request start to first response byte. Zoom in to see its 50 ms bins."
+        }
+    });
+    let hv = Hover {
+        crosshair: Some(p.x),
+        highlight: Some((p, dir_color(r.dir))),
+        tip: Some(tip),
+        anchor: p,
+    };
+    Some((hv, d))
+}
+
+/// One column of dense samples: their range and median (aggregates: mean).
+#[derive(Clone, Copy, Debug)]
+struct Col {
+    /// Centre and width in points.
+    x: f32,
+    w: f32,
+    min: f64,
+    max: f64,
+    /// Interquartile range, when the column holds raw samples.
+    iqr: Option<(f64, f64)>,
+    mid: f64,
+    /// The line breaks before this column (a gap in the samples).
+    gap: bool,
+}
+
+/// Summarises `(t, value)` samples per `palette::COLUMN`-wide column; a
+/// `None` value or a pause longer than `gap_limit` breaks the line.
+fn columns_raw(
+    out: &mut Vec<Col>,
+    vals: &mut Vec<f64>,
+    tf: &Transform,
+    gap_limit: f64,
+    items: impl Iterator<Item = (f64, Option<f64>)>,
+) {
+    out.clear();
+    vals.clear();
+    let w = palette::COLUMN;
+    let col_of = |t: f64| ((tf.x(t) - tf.rect.x0) / w).floor() as i64;
+    let mut cur: Option<i64> = None;
+    let mut gap = false;
+    let mut prev_t: Option<f64> = None;
+    let flush = |out: &mut Vec<Col>, vals: &mut Vec<f64>, c: i64, gap: bool| {
+        if let Some(sm) = crate::stats::summarize(vals) {
+            out.push(Col {
+                x: tf.rect.x0 + (c as f32 + 0.5) * w,
+                w,
+                min: sm.min,
+                max: sm.max,
+                iqr: Some((sm.p25, sm.p75)),
+                mid: sm.median,
+                gap,
+            });
+        }
+        vals.clear();
+    };
+    for (t, v) in items {
+        let Some(v) = v else {
+            if let Some(c) = cur.take() {
+                flush(out, vals, c, gap);
+            }
+            gap = true;
+            continue;
+        };
+        let c = col_of(t);
+        if prev_t.is_some_and(|p| t - p > gap_limit) {
+            if let Some(c) = cur.take() {
+                flush(out, vals, c, gap);
+            }
+            gap = true;
+        }
+        if cur != Some(c) {
+            if let Some(c) = cur {
+                flush(out, vals, c, gap);
+                gap = false;
+            }
+            cur = Some(c);
+        }
+        vals.push(v);
+        prev_t = Some(t);
+    }
+    if let Some(c) = cur {
+        flush(out, vals, c, gap);
+    }
+}
+
+/// Columns from aggregate buckets (range and mean), for views too long to
+/// walk raw samples. Empty buckets break the line.
+fn columns_tier(out: &mut Vec<Col>, tier: &Tier, tf: &Transform, until: f64) {
+    out.clear();
+    let bw = (tier.width / (tf.t1 - tf.t0).max(1e-9)) as f32 * tf.rect.width();
+    let w = palette::COLUMN.max(bw);
+    let mut cur: Option<(i64, f64, f64, f64, u32, bool)> = None;
+    let mut gap = false;
+    let push = |out: &mut Vec<Col>, (c, min, max, sum, n, gap): (i64, f64, f64, f64, u32, bool)| {
+        out.push(Col {
+            x: tf.rect.x0 + (c as f32 + 0.5) * w,
+            w,
+            min,
+            max,
+            iqr: None,
+            mid: sum / f64::from(n.max(1)),
+            gap,
+        });
+    };
+    let mut i = tier.first_ending_after(tf.t0);
+    while let Some(bk) = tier.get(i) {
+        if bk.t0 > tf.t1 || bk.t0 >= until {
+            break;
+        }
+        i += 1;
+        if bk.n == 0 {
+            if let Some(c) = cur.take() {
+                push(out, c);
+            }
+            gap = true;
+            continue;
+        }
+        let c = ((tf.x(bk.t0 + tier.width / 2.0) - tf.rect.x0) / w).floor() as i64;
+        match &mut cur {
+            Some(a) if a.0 == c => {
+                a.1 = a.1.min(bk.min);
+                a.2 = a.2.max(bk.max);
+                a.3 += bk.sum;
+                a.4 += bk.n;
+            }
+            _ => {
+                if let Some(a) = cur.take() {
+                    push(out, a);
+                }
+                cur = Some((c, bk.min, bk.max, bk.sum, bk.n, gap));
+                gap = false;
+            }
+        }
+    }
+    if let Some(a) = cur {
+        push(out, a);
+    }
+}
+
+/// Per column, a faint band over the full range and a stronger one over
+/// the middle half, and a line through the medians: the typical value
+/// reads first, every extreme is still drawn.
+fn draw_columns(
+    sc: &mut Scene,
+    cols: &[Col],
+    tf: &Transform,
+    color: Color,
+    width: f32,
+    pts: &mut Vec<Point>,
+) {
+    let plot = tf.rect;
+    for c in cols {
+        let bands = [(c.min, c.max, palette::RANGE_ALPHA)]
+            .into_iter()
+            .chain(c.iqr.map(|(a, b)| (a, b, palette::IQR_ALPHA)));
+        for (lo, hi, alpha) in bands {
+            let (y0, y1) = (tf.yc(hi), tf.yc(lo));
+            if y1 - y0 >= 0.5 {
+                sc.fill(
+                    Rect {
+                        x0: (c.x - c.w / 2.0).max(plot.x0),
+                        y0,
+                        x1: (c.x + c.w / 2.0).min(plot.x1),
+                        y1,
+                    },
+                    color,
+                    alpha,
+                );
+            }
+        }
+    }
+    pts.clear();
+    for c in cols {
+        if c.gap && !pts.is_empty() {
+            sc.line(pts, width, color, 1.0);
+            pts.clear();
+        }
+        pts.push(pt(c.x, tf.yc(c.mid)));
+    }
+    sc.line(pts, width, color, 1.0);
+}
+
+/// Whether samples this dense are drawn as columns.
+fn banded(visible_samples: usize, plot: Rect) -> bool {
+    visible_samples as f32 > plot.width() / palette::COLUMN * 1.5
+}
+
+/// Whether a view is so long that per-minute aggregates are no coarser
+/// than a column, so they can stand in for the raw samples.
+fn tier_columns(tf: &Transform) -> bool {
+    let secs_per_pt = (tf.t1 - tf.t0) / f64::from(tf.rect.width().max(1.0));
+    secs_per_pt * f64::from(palette::COLUMN) >= 60.0
+}
+
 fn bucket_at(tier: &Tier, t: f64) -> Option<&Bucket> {
     let i = tier.first_ending_after(t);
     tier.get(i).filter(|b| b.t0 <= t)
@@ -249,29 +589,33 @@ fn band_tip(inp: &Inputs<'_>, t: f64) -> Option<Tip> {
 }
 
 impl Charts {
-    fn throughput_stats(
-        &mut self,
-        s: &Session,
-        view: &TimeView,
-        t0: f64,
-        t1: f64,
-    ) -> (f64, [Pct; 2]) {
+    fn throughput_stats(&mut self, s: &Session, view: &TimeView, t0: f64, t1: f64) -> TputStats {
         let vals = &mut self.vals;
         self.tput_stats.get(stats_key(s, view), || {
-            let mut vmax: f64 = 0.0;
+            let mut bins_max: f64 = 0.0;
             for series in &s.throughput {
                 let (a, b) = visible(series, t0, t1);
                 for x in series.raw.range(a, b) {
-                    vmax = vmax.max(x.bps);
+                    bins_max = bins_max.max(x.bps);
                 }
                 if let Some((tier, until)) = aged_tier(series, t0, t1) {
                     for bk in tier
                         .iter()
                         .filter(|bk| bk.t0 + tier.width > t0 && bk.t0 < until && bk.n > 0)
                     {
-                        vmax = vmax.max(bk.max);
+                        bins_max = bins_max.max(bk.max);
                     }
                 }
+            }
+            let (mut req_max, mut dur, mut n) = (0.0f64, 0.0, 0u32);
+            let first = s.requests.partition_point(|r| r.t_end < t0);
+            for r in s.requests.range(first, s.requests.len()) {
+                if r.t_start > t1 {
+                    break;
+                }
+                req_max = req_max.max(r.bps.unwrap_or(0.0));
+                dur += r.t_end - r.t_start;
+                n += 1;
             }
             let mut pct = [None, None];
             for (i, dir) in [Direction::Download, Direction::Upload]
@@ -286,27 +630,44 @@ impl Charts {
                 );
                 pct[i] = crate::stats::summarize(vals).map(|sm| (sm.median, sm.p90));
             }
-            (vmax, pct)
+            TputStats {
+                bins_max,
+                req_max,
+                mean_req_secs: if n > 0 { dur / f64::from(n) } else { 0.0 },
+                pct,
+            }
         })
     }
 
+    /// The transform, whether there is anything to draw, the per-request
+    /// percentiles, and whether requests are drawn as points (too narrow
+    /// at this zoom to show their bins).
     fn throughput_tf(
         &mut self,
         inp: &Inputs<'_>,
         view: &TimeView,
         w: f32,
         h: f32,
-    ) -> (Transform, bool, [Pct; 2]) {
+    ) -> (Transform, bool, [Pct; 2], bool) {
         let (t0, t1) = view.range(inp.run_end);
-        let (vmax, pct) = self.throughput_stats(inp.s, view, t0, t1);
+        let st = self.throughput_stats(inp.s, view, t0, t1);
+        let rect = time_plot(w, h);
+        let secs_per_pt = (t1 - t0) / f64::from(rect.width().max(1.0));
+        let narrow = st.req_max > 0.0
+            && st.mean_req_secs < f64::from(palette::REQUEST_MIN_WIDTH) * secs_per_pt;
+        let vmax = if narrow {
+            st.req_max
+        } else {
+            st.bins_max.max(st.req_max)
+        };
         let tf = Transform {
-            rect: time_plot(w, h),
+            rect,
             t0,
             t1,
             v0: 0.0,
             v1: nice_max(vmax),
         };
-        (tf, vmax > 0.0, pct)
+        (tf, vmax > 0.0, st.pct, narrow)
     }
 
     /// Throughput chart of `w`×`h` points.
@@ -319,7 +680,7 @@ impl Charts {
         label_h: f32,
         sc: &mut Scene,
     ) {
-        let (tf, has_data, pct) = self.throughput_tf(inp, view, w, h);
+        let (tf, has_data, pct, narrow) = self.throughput_tf(inp, view, w, h);
         let plot = tf.rect;
         let s = inp.s;
         sc.clear(plot);
@@ -353,14 +714,33 @@ impl Charts {
             let color = dir_color(dir);
             let (a, e) = visible(series, t0, t1);
             let mut dec = Decimator::new(&mut self.pts, &mut self.breaks);
-            if coarse(e - a, plot) {
+            if narrow {
+                // One point per request at its throughput, joined in time
+                // order: the trend across cycles.
+                self.aux.clear();
+                request_trend(&mut dec, &mut self.aux, &mut self.vals, s, dir, &tf);
+            } else if coarse(e - a, plot) {
                 feed_buckets(&mut dec, tier_for(series, t0), &tf);
             } else {
                 if let Some((tier, until)) = aged_tier(series, t0, t1) {
                     draw_buckets(sc, tier, until, &tf, color, &mut self.aux);
                 }
                 let mut prev: Option<(u32, f64)> = None;
+                let mut skip: Option<(u32, bool)> = None;
                 for x in series.raw.range(a, e) {
+                    // Requests too narrow to show their bins are drawn as
+                    // one point below instead.
+                    let narrow_req = match skip {
+                        Some((id, n)) if id == x.request => n,
+                        _ => {
+                            let n = s.request(x.request).is_some_and(|r| narrow_request(&tf, r));
+                            skip = Some((x.request, n));
+                            n
+                        }
+                    };
+                    if narrow_req {
+                        continue;
+                    }
                     if let Some((req, pt)) = prev
                         && (req != x.request || x.t - pt > 0.5)
                     {
@@ -369,13 +749,26 @@ impl Charts {
                     dec.push(tf.pos(x.t, x.bps));
                     prev = Some((x.request, x.t));
                 }
+                self.aux.clear();
+                let (ra, rb) = visible_requests(s, t0, t1);
+                self.aux.extend(
+                    s.requests
+                        .range(ra, rb)
+                        .filter(|r| r.dir == dir && narrow_request(&tf, r))
+                        .filter_map(|r| Some(tf.pos((r.t_start + r.t_end) / 2.0, r.bps?))),
+                );
             }
             dec.finish();
-            for (i, j) in segments(&self.breaks) {
-                sc.area(&self.pts[i..j], plot.y1, color, palette::FILL_ALPHA);
+            if !narrow {
+                for (i, j) in segments(&self.breaks) {
+                    sc.area(&self.pts[i..j], plot.y1, color, palette::FILL_ALPHA);
+                }
             }
             for (i, j) in segments(&self.breaks) {
                 sc.line(&self.pts[i..j], palette::DATA_LINE, color, 1.0);
+            }
+            if !narrow || self.aux.len() as f32 <= plot.width() / palette::DOT_MIN_SPACING {
+                sc.dots(&self.aux, palette::POINT_RADIUS, color, 1.0);
             }
             // Percentiles of per-request throughput in view.
             if let Some((p50, p90)) = pct[di] {
@@ -408,12 +801,17 @@ impl Charts {
         h: f32,
         hp: Point,
     ) -> Hover {
-        let (tf, has_data, _) = self.throughput_tf(inp, view, w, h);
+        let (tf, has_data, _, narrow) = self.throughput_tf(inp, view, w, h);
         let plot = tf.rect;
         let s = inp.s;
         if !has_data || !plot.contains(hp) {
             return Hover::default();
         }
+        if narrow {
+            return request_hover(inp, &tf, hp, |_| true).map_or_else(Hover::default, |h| h.0);
+        }
+        // Requests too narrow for their bins are drawn as points.
+        let req = request_hover(inp, &tf, hp, |r| narrow_request(&tf, r));
         let th = tf.t_at(hp.x);
         if let Some((tier, until)) =
             aged_tier(&s.throughput[0], tf.t0, tf.t1).or(aged_tier(&s.throughput[1], tf.t0, tf.t1))
@@ -438,10 +836,19 @@ impl Charts {
         }
         // Nearest bin in either direction, by horizontal distance, then
         // vertical when both are close.
+        // Bins of narrow requests aren't drawn, so they're skipped.
+        let shown = |x: &crate::model::ThroughputSample| {
+            !s.request(x.request).is_some_and(|r| narrow_request(&tf, r))
+        };
         let mut best: Option<(f32, usize, usize)> = None;
         for (di, series) in s.throughput.iter().enumerate() {
             let i = series.raw.partition_point(|x| x.t < th);
-            for j in [i.saturating_sub(1), i] {
+            let left = (i.saturating_sub(BIN_SEARCH)..i)
+                .rev()
+                .find(|&j| series.raw.get(j).is_some_and(shown));
+            let right = (i..(i + BIN_SEARCH).min(series.raw.len()))
+                .find(|&j| series.raw.get(j).is_some_and(shown));
+            for j in [left, right].into_iter().flatten() {
                 if let Some(x) = series.raw.get(j) {
                     let p = tf.pos(x.t, x.bps);
                     let d = (p.x - hp.x).abs() + 0.25 * (p.y - hp.y).abs();
@@ -450,6 +857,11 @@ impl Charts {
                     }
                 }
             }
+        }
+        if let Some((hv, d)) = req
+            && best.is_none_or(|(bd, _, _)| d <= bd)
+        {
+            return hv;
         }
         let Some((_, di, j)) = best else {
             return Hover::default();
@@ -496,58 +908,71 @@ impl Charts {
         }
     }
 
-    fn latency_stats(&mut self, s: &Session, view: &TimeView, t0: f64, t1: f64) -> (f64, Pct) {
+    fn latency_stats(&mut self, s: &Session, view: &TimeView, t0: f64, t1: f64) -> LatStats {
         let (lat, gw) = (&s.latency, &s.gateway);
         let (la, lb) = visible(lat, t0, t1);
         let (ga, gb) = visible(gw, t0, t1);
         let vals = &mut self.vals;
         self.lat_stats.get(stats_key(s, view), || {
-            let mut vmax: f64 = 0.0;
-            for x in lat.raw.range(la, lb) {
-                vmax = vmax.max(x.ms);
-            }
-            for x in gw.raw.range(ga, gb) {
-                if let Some(m) = x.ms {
-                    vmax = vmax.max(m);
-                }
-            }
+            let mut max: f64 = 0.0;
             if let Some((tier, until)) = aged_tier(lat, t0, t1) {
                 for bk in tier
                     .iter()
                     .filter(|bk| bk.t0 + tier.width > t0 && bk.t0 < until && bk.n > 0)
                 {
-                    vmax = vmax.max(bk.max);
+                    max = max.max(bk.max);
                 }
             }
-            vals.clear();
-            vals.extend(
+            let gw_sm = crate::stats::summarize_iter(
+                vals,
+                gw.raw
+                    .range(ga, gb)
+                    .filter(|x| x.t >= t0 && x.t <= t1)
+                    .filter_map(|x| x.ms),
+            );
+            let lat_sm = crate::stats::summarize_iter(
+                vals,
                 lat.raw
                     .range(la, lb)
                     .filter(|x| x.t >= t0 && x.t <= t1)
                     .map(|x| x.ms),
             );
-            let pct = crate::stats::summarize(vals).map(|sm| (sm.median, sm.p90));
-            (vmax, pct)
+            let mut n = 0;
+            let mut p99: Option<f64> = None;
+            for sm in [lat_sm, gw_sm].into_iter().flatten() {
+                max = max.max(sm.max);
+                n += sm.n;
+                p99 = Some(p99.unwrap_or(0.0).max(sm.p99));
+            }
+            LatStats {
+                max,
+                top: robust_top(max, p99, n),
+                pct: lat_sm.map(|sm| (sm.median, sm.p90)),
+            }
         })
     }
 
+    /// The transform (its rect stops above the loss lane), whether there
+    /// is anything to draw, and the statistics.
     fn latency_tf(
         &mut self,
         inp: &Inputs<'_>,
         view: &TimeView,
         w: f32,
         h: f32,
-    ) -> (Transform, bool, Pct) {
+    ) -> (Transform, bool, LatStats) {
         let (t0, t1) = view.range(inp.run_end);
-        let (vmax, pct) = self.latency_stats(inp.s, view, t0, t1);
+        let st = self.latency_stats(inp.s, view, t0, t1);
+        let mut rect = time_plot(w, h);
+        rect.y1 = (rect.y1 - palette::LOSS_LANE).max(rect.y0 + 1.0);
         let tf = Transform {
-            rect: time_plot(w, h),
+            rect,
             t0,
             t1,
             v0: 0.0,
-            v1: nice_max(vmax),
+            v1: st.top,
         };
-        (tf, vmax > 0.0, pct)
+        (tf, st.max > 0.0, st)
     }
 
     /// Latency over time with gateway pings, load periods and loss ticks.
@@ -560,8 +985,9 @@ impl Charts {
         label_h: f32,
         sc: &mut Scene,
     ) {
-        let (tf, has_data, pct) = self.latency_tf(inp, view, w, h);
-        let plot = tf.rect;
+        let (tf, has_data, st) = self.latency_tf(inp, view, w, h);
+        let plot = time_plot(w, h);
+        let data = tf.rect;
         let (t0, t1) = (tf.t0, tf.t1);
         let s = inp.s;
         let (lat, gw) = (&s.latency, &s.gateway);
@@ -572,12 +998,12 @@ impl Charts {
             nice_ticks(
                 0.0,
                 tf.v1,
-                (plot.height() / palette::TICK_SPACING_Y) as usize,
+                (data.height() / palette::TICK_SPACING_Y) as usize,
                 &mut self.ticks,
             );
             value_axis(sc, &tf, &self.ticks, &format::tick, "ms");
         }
-        let base = plot.y1.round() + 0.5;
+        let base = data.y1.round() + 0.5;
         sc.segment(
             pt(plot.x0, base),
             pt(plot.x1, base),
@@ -586,10 +1012,14 @@ impl Charts {
             1.0,
         );
         if s.wall_start.is_some() {
-            time_axis(sc, &tf, inp.wall0, &mut self.ticks);
+            time_axis(
+                sc,
+                &Transform { rect: plot, ..tf },
+                inp.wall0,
+                &mut self.ticks,
+            );
         }
         let gap_limit = (3.5 * s.config.continuous.latency_interval.as_secs_f64()).max(2.0);
-        let dense = (lb - la) as f32 > plot.width() / palette::DOT_MIN_SPACING;
         // Load periods: when a download or upload was running.
         let first = s.requests.partition_point(|r| r.t_end < t0);
         for r in s.requests.range(first, s.requests.len()) {
@@ -604,7 +1034,7 @@ impl Charts {
                         x0,
                         y0: plot.y0,
                         x1,
-                        y1: plot.y1,
+                        y1: data.y1,
                     },
                     dir_color(r.dir),
                     palette::BAND_ALPHA,
@@ -622,19 +1052,31 @@ impl Charts {
                         x0,
                         y0: plot.y0,
                         x1,
-                        y1: plot.y1,
+                        y1: data.y1,
                     },
                     Color::Text3,
                     palette::BAND_ALPHA,
                 );
             }
         }
-        // Gateway pings.
         sc.clip_x(Some((plot.x0, plot.x1)));
-        let mut dec = Decimator::new(&mut self.pts, &mut self.breaks);
-        if coarse(gb - ga, plot) {
-            feed_buckets(&mut dec, tier_for(gw, t0), &tf);
+        let by_tier = tier_columns(&tf);
+        // Gateway pings, then latency over them.
+        if banded(gb - ga, data) {
+            if by_tier {
+                columns_tier(&mut self.cols, tier_for(gw, t0), &tf, f64::INFINITY);
+            } else {
+                columns_raw(
+                    &mut self.cols,
+                    &mut self.vals,
+                    &tf,
+                    gap_limit,
+                    gw.raw.range(ga, gb).map(|x| (x.t, x.ms)),
+                );
+            }
+            draw_columns(sc, &self.cols, &tf, GATEWAY, palette::STROKE, &mut self.pts);
         } else {
+            let mut dec = Decimator::new(&mut self.pts, &mut self.breaks);
             let mut prev_t: Option<f64> = None;
             for x in gw.raw.range(ga, gb) {
                 match x.ms {
@@ -642,47 +1084,63 @@ impl Charts {
                         if prev_t.is_some_and(|p| x.t - p > gap_limit) {
                             dec.gap();
                         }
-                        dec.push(tf.pos(x.t, m));
+                        dec.push(tf.posc(x.t, m));
                         prev_t = Some(x.t);
                     }
                     None => dec.gap(),
                 }
             }
+            dec.finish();
+            for (i, j) in segments(&self.breaks) {
+                sc.line(&self.pts[i..j], palette::STROKE, GATEWAY, 1.0);
+            }
         }
-        dec.finish();
-        for (i, j) in segments(&self.breaks) {
-            sc.line(&self.pts[i..j], palette::STROKE, GATEWAY, 1.0);
-        }
-        // Latency.
-        let lat_coarse = coarse(lb - la, plot);
-        if !lat_coarse && let Some((tier, until)) = aged_tier(lat, t0, t1) {
+        if !by_tier && let Some((tier, until)) = aged_tier(lat, t0, t1) {
             draw_buckets(sc, tier, until, &tf, Color::Latency, &mut self.aux);
         }
-        let mut dec = Decimator::new(&mut self.pts, &mut self.breaks);
-        if lat_coarse {
-            feed_buckets(&mut dec, tier_for(lat, t0), &tf);
+        if banded(lb - la, data) {
+            if by_tier {
+                columns_tier(&mut self.cols, tier_for(lat, t0), &tf, f64::INFINITY);
+            } else {
+                columns_raw(
+                    &mut self.cols,
+                    &mut self.vals,
+                    &tf,
+                    gap_limit,
+                    lat.raw.range(la, lb).map(|x| (x.t, Some(x.ms))),
+                );
+            }
+            draw_columns(
+                sc,
+                &self.cols,
+                &tf,
+                Color::Latency,
+                palette::DATA_LINE,
+                &mut self.pts,
+            );
         } else {
+            let mut dec = Decimator::new(&mut self.pts, &mut self.breaks);
             let mut prev_t: Option<f64> = None;
             for x in lat.raw.range(la, lb) {
                 if prev_t.is_some_and(|p| x.t - p > gap_limit) {
                     dec.gap();
                 }
-                dec.push(tf.pos(x.t, x.ms));
+                dec.push(tf.posc(x.t, x.ms));
                 prev_t = Some(x.t);
             }
-        }
-        dec.finish();
-        for (i, j) in segments(&self.breaks) {
-            sc.line(&self.pts[i..j], palette::DATA_LINE, Color::Latency, 1.0);
-        }
-        if !dense {
-            self.aux.clear();
-            self.aux
-                .extend(lat.raw.range(la, lb).map(|x| tf.pos(x.t, x.ms)));
-            sc.dots(&self.aux, palette::POINT_RADIUS, Color::Latency, 1.0);
+            dec.finish();
+            for (i, j) in segments(&self.breaks) {
+                sc.line(&self.pts[i..j], palette::DATA_LINE, Color::Latency, 1.0);
+            }
+            if (lb - la) as f32 <= data.width() / palette::DOT_MIN_SPACING {
+                self.aux.clear();
+                self.aux
+                    .extend(lat.raw.range(la, lb).map(|x| tf.posc(x.t, x.ms)));
+                sc.dots(&self.aux, palette::POINT_RADIUS, Color::Latency, 1.0);
+            }
         }
         sc.clip_x(None);
-        // Lost UDP probes.
+        // Lost UDP probes, in their own lane under the plot.
         loss_ticks(
             sc,
             s,
@@ -691,8 +1149,10 @@ impl Charts {
             plot.y1 - palette::LOSS_TICK,
             palette::DATA_LINE,
         );
-        // Percentiles of visible latency.
-        if let Some((p50, p90)) = pct {
+        // Percentiles of visible latency, and the maximum when spikes run
+        // past the top of the axis.
+        let mut labels: Vec<(f32, String, Color)> = Vec::new();
+        if let Some((p50, p90)) = st.pct {
             for v in [p50, p90] {
                 sc.dashed_hline(
                     plot.x0,
@@ -702,18 +1162,77 @@ impl Charts {
                     palette::PERCENTILE_ALPHA,
                 );
             }
-            let mut labels: Vec<(f32, String, Color)> = [("p50", p50), ("p90", p90)]
-                .iter()
-                .map(|(name, v)| {
-                    (
-                        tf.y(*v),
-                        format!("{name} {} ms", format::ms(*v)),
-                        Color::Latency,
-                    )
-                })
-                .collect();
-            percentile_labels(sc, plot, label_h, &mut labels);
+            labels.extend([("p50", p50), ("p90", p90)].iter().map(|(name, v)| {
+                (
+                    tf.y(*v),
+                    format!("{name} {} ms", format::ms(*v)),
+                    Color::Latency,
+                )
+            }));
         }
+        if st.max > tf.v1 {
+            labels.push((
+                data.y0,
+                format!("max {} ms", format::ms(st.max)),
+                Color::Text2,
+            ));
+        }
+        percentile_labels(sc, data, label_h, &mut labels);
+    }
+
+    /// Summary of the column under the pointer when latency is drawn as
+    /// columns: every probe in it, the gateway pings and lost UDP probes.
+    fn column_hover(&mut self, inp: &Inputs<'_>, tf: &Transform, hp: Point) -> Option<Hover> {
+        let s = inp.s;
+        let w = palette::COLUMN;
+        let c = ((hp.x - tf.rect.x0) / w).floor();
+        let (x0, x1) = (tf.rect.x0 + c * w, tf.rect.x0 + (c + 1.0) * w);
+        let (ta, tb) = (tf.t_at(x0), tf.t_at(x1));
+        let (la, lb) = s.latency.raw_range(ta, tb);
+        let lat = crate::stats::summarize_iter(
+            &mut self.vals,
+            s.latency.raw.range(la, lb).map(|x| x.ms),
+        )?;
+        let (ga, gb) = s.gateway.raw_range(ta, tb);
+        let gw = crate::stats::summarize_iter(
+            &mut self.vals,
+            s.gateway.raw.range(ga, gb).filter_map(|x| x.ms),
+        );
+        let (pa, pb) = s.loss.raw_range(ta, tb);
+        let lost = s
+            .loss
+            .raw
+            .range(pa, pb)
+            .filter(|p| p.outcome == ProbeOutcome::Lost)
+            .count();
+        let mut tip = Tip::default()
+            .title(format!("Latency · {} – {}", wall(inp, ta), wall(inp, tb)))
+            .pair("Probes", format::count(lat.n as u64))
+            .pair("Min", format!("{} ms", format::ms(lat.min)))
+            .pair("Median", format!("{} ms", format::ms(lat.median)))
+            .pair("Max", format!("{} ms", format::ms(lat.max)));
+        if let Some(g) = gw {
+            tip.push_pair("Gateway median", format!("{} ms", format::ms(g.median)));
+        }
+        tip.push_pair(
+            "UDP probes lost",
+            format!(
+                "{} of {}",
+                format::count(lost as u64),
+                format::count((pb - pa) as u64)
+            ),
+        );
+        let tip = tip.note(
+            "Each column spans the probes in this time range: the band is their range, the line their median. Zoom in to see every probe.",
+        );
+        let x = (x0 + x1) / 2.0;
+        let p = pt(x, tf.yc(lat.median));
+        Some(Hover {
+            crosshair: Some(x),
+            highlight: Some((p, Color::Latency)),
+            tip: Some(tip),
+            anchor: p,
+        })
     }
 
     pub fn latency_hover(
@@ -725,7 +1244,7 @@ impl Charts {
         hp: Point,
     ) -> Hover {
         let (tf, has_data, _) = self.latency_tf(inp, view, w, h);
-        let plot = tf.rect;
+        let plot = time_plot(w, h);
         let s = inp.s;
         if !plot.contains(hp) {
             return Hover::default();
@@ -734,7 +1253,7 @@ impl Charts {
         let (lat, gw) = (&s.latency, &s.gateway);
 
         // Loss ticks take the hover near the bottom edge.
-        if hp.y > plot.y1 - palette::LOSS_TICK - palette::S4 {
+        if hp.y > tf.rect.y1 {
             let i = s.loss.raw.partition_point(|p| p.t < th);
             let near = s
                 .loss
@@ -790,6 +1309,12 @@ impl Charts {
                 anchor: pt(x, hp.y),
             };
         }
+        let (la, lb) = visible(lat, tf.t0, tf.t1);
+        if banded(lb - la, tf.rect)
+            && let Some(hv) = self.column_hover(inp, &tf, hp)
+        {
+            return hv;
+        }
         let i = lat.raw.partition_point(|x| x.t < th);
         let best_lat = [i.saturating_sub(1), i]
             .into_iter()
@@ -809,8 +1334,8 @@ impl Charts {
                     .abs()
                     .total_cmp(&(tf.x(b.t) - hp.x).abs())
             });
-        let lat_p = best_lat.map(|x| tf.pos(x.t, x.ms));
-        let gw_p = best_gw.and_then(|g| g.ms.map(|m| tf.pos(g.t, m)));
+        let lat_p = best_lat.map(|x| tf.posc(x.t, x.ms));
+        let gw_p = best_gw.and_then(|g| g.ms.map(|m| tf.posc(g.t, m)));
         let score = |p: Point| (p.x - hp.x).abs() + (p.y - hp.y).abs() * 0.5;
         let use_gw = match (lat_p, gw_p) {
             (Some(a), Some(g)) => score(g) < score(a),
@@ -887,7 +1412,7 @@ impl Charts {
 
     /// Whole-run strip with the visible window marked.
     pub fn overview(&mut self, inp: &Inputs<'_>, view: &TimeView, w: f32, h: f32, sc: &mut Scene) {
-        let tf = overview_tf(inp, w, h);
+        let (tf, narrow) = overview_tf(inp, w, h);
         let plot = tf.rect;
         let s = inp.s;
         sc.clear(plot);
@@ -898,8 +1423,18 @@ impl Charts {
             } else {
                 Color::Upload
             };
-            // Raw bins when they're all present, aggregates otherwise.
+            // Raw bins while every request is wide enough to show them,
+            // otherwise the per-cycle trend.
             let mut dec = Decimator::new(&mut self.pts, &mut self.breaks);
+            if narrow {
+                self.aux.clear();
+                request_trend(&mut dec, &mut self.aux, &mut self.vals, s, dir_of(di), &tf);
+                dec.finish();
+                for (i, j) in segments(&self.breaks) {
+                    sc.line(&self.pts[i..j], palette::STROKE, color, 1.0);
+                }
+                continue;
+            }
             if series.raw_complete() && !coarse(series.raw.len(), plot) {
                 let mut prev: Option<u32> = None;
                 for x in series.raw.iter() {
@@ -971,7 +1506,7 @@ impl Charts {
     }
 
     pub fn overview_hover(inp: &Inputs<'_>, w: f32, h: f32, hp: Point) -> Hover {
-        let tf = overview_tf(inp, w, h);
+        let (tf, _) = overview_tf(inp, w, h);
         if inp.s.wall_start.is_none() || !tf.rect.contains(hp) {
             return Hover::default();
         }
@@ -995,7 +1530,9 @@ impl Charts {
 }
 
 /// The overview strip spans the whole run across the time plots' extent.
-pub fn overview_tf(inp: &Inputs<'_>, w: f32, h: f32) -> Transform {
+/// True with it when requests are too narrow at this scale to show their
+/// bins, so it draws the per-cycle trend.
+pub fn overview_tf(inp: &Inputs<'_>, w: f32, h: f32) -> (Transform, bool) {
     let x = time_plot(w, h);
     let rect = Rect {
         x0: x.x0,
@@ -1003,19 +1540,34 @@ pub fn overview_tf(inp: &Inputs<'_>, w: f32, h: f32) -> Transform {
         x1: x.x1,
         y1: h,
     };
+    let t1 = inp.run_end.max(1.0);
+    let s = inp.s;
+    let (mut req_max, mut dur) = (0.0f64, 0.0);
+    for r in s.requests.iter() {
+        req_max = req_max.max(r.bps.unwrap_or(0.0));
+        dur += r.t_end - r.t_start;
+    }
+    let secs_per_pt = t1 / f64::from(rect.width().max(1.0));
+    let narrow = !s.requests.is_empty()
+        && dur / (s.requests.len() as f64) < f64::from(palette::REQUEST_MIN_WIDTH) * secs_per_pt;
     let mut vmax: f64 = 0.0;
-    for series in &inp.s.throughput {
-        for b in series.minute.iter() {
-            if b.n > 0 {
-                vmax = vmax.max(b.max);
+    if narrow {
+        vmax = req_max;
+    } else {
+        for series in &s.throughput {
+            for b in series.minute.iter() {
+                if b.n > 0 {
+                    vmax = vmax.max(b.max);
+                }
             }
         }
     }
-    Transform {
+    let tf = Transform {
         rect,
         t0: 0.0,
-        t1: inp.run_end.max(1.0),
+        t1,
         v0: 0.0,
         v1: nice_max(vmax),
-    }
+    };
+    (tf, narrow)
 }

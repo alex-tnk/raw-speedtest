@@ -250,6 +250,9 @@ final class Model {
     /// Bumped on every pull, so charts ask for their scene again (the time
     /// axis moves with the clock even without new data).
     private(set) var dataVersion: UInt64 = 0
+    /// Bumped while a live run scrolls the time charts; only they observe
+    /// it. They also pick up new samples on it, between frame pulls.
+    private(set) var clock: UInt64 = 0
     var inspector = true
     var logTab = 0
     var menuBar = false {
@@ -380,12 +383,33 @@ final class Model {
         let (k, i) = kind.raw
         guard rst_chart(handle, k, i, Float(size.width), Float(size.height), Float(Theme.labelHeight), &s)
         else { return nil }
+        if kind == .throughput { scheduleLive(size.width) }
         if let cached = scenes[kind], cached.generation == s.generation {
             return cached
         }
         let draw = SceneDraw(s, model: self)
         scenes[kind] = draw
         return draw
+    }
+
+    @ObservationIgnored private var liveItem: DispatchWorkItem?
+
+    /// While the time charts follow a live run, ask for their scenes again
+    /// as soon as the time axis has moved a point, so they scroll smoothly
+    /// instead of jumping once per frame pull.
+    private func scheduleLive(_ width: CGFloat) {
+        guard liveItem == nil, windowOpen else { return }
+        let ms = rst_live_ms(handle, Float(width))
+        guard ms > 0 else { return }
+        let item = DispatchWorkItem {
+            MainActor.assumeIsolated {
+                let m = Model.shared
+                m.liveItem = nil
+                if m.windowOpen { m.clock &+= 1 }
+            }
+        }
+        liveItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(Int(ms)), execute: item)
     }
 
     /// The plot area of the chart's last scene.

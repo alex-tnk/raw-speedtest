@@ -425,6 +425,19 @@ pub extern "C" fn rst_view(ptr: *mut RstCore, op: u32, factor: f64, x: f32, w: f
     }
 }
 
+/// While the time charts follow a live run: milliseconds until their time
+/// axis has moved one point in a chart `w` wide. 0 when it isn't moving.
+#[unsafe(no_mangle)]
+pub extern "C" fn rst_live_ms(ptr: *mut RstCore, w: f32) -> u32 {
+    // SAFETY: the pointer Swift received from `rst_ui_main`.
+    let Some(c) = (unsafe { core(ptr) }) else {
+        return 0;
+    };
+    c.core
+        .live_interval(w.max(1.0))
+        .map_or(0, |d| d.as_millis().clamp(1, 1000) as u32)
+}
+
 /// Choose option `index` of setting `setting` (`Setting` order).
 #[unsafe(no_mangle)]
 pub extern "C" fn rst_set(ptr: *mut RstCore, setting: u32, index: u32) {

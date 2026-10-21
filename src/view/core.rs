@@ -196,6 +196,23 @@ impl Core {
         }
     }
 
+    /// While a run is active and the time charts follow the newest data,
+    /// how long until their time axis has moved by one point in a chart
+    /// `w` wide: redrawing that often scrolls them smoothly without
+    /// rebuilding a scene for nothing. At most 30 times a second, the rate
+    /// a streaming transfer redraws at.
+    // Not every shell uses every part of the view layer.
+    #[allow(dead_code)]
+    pub fn live_interval(&self, w: f32) -> Option<Duration> {
+        let s = self.ctl.session();
+        if !s.active() || self.view.end.is_some() {
+            return None;
+        }
+        let (t0, t1) = self.view.range(s.now()?);
+        let secs_per_pt = (t1 - t0) / f64::from(time_plot(w, 1.0).width().max(1.0));
+        Some(Duration::from_secs_f64(secs_per_pt.clamp(1.0 / 30.0, 1.0)))
+    }
+
     /// The scene of chart `id` at `w`×`h` points; `label_h` is the height
     /// of a small text line, used to keep percentile labels apart.
     pub fn scene(&mut self, id: ChartId, w: f32, h: f32, label_h: f32) -> &Scene {
@@ -539,6 +556,60 @@ mod tests {
                 t.elapsed()
             );
         }
+    }
+
+    fn texts(sc: &Scene) -> Vec<String> {
+        sc.prims
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Text { range, .. } => Some(sc.str(range).to_owned()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Hours into a run, rare latency spikes don't set the axis, and each
+    /// throughput request is one point rather than a sliver of bins.
+    #[test]
+    fn long_runs_cut_spikes_and_draw_requests_as_points() {
+        let mut core = core_with(3.0 * 3600.0);
+        let lat = core.scene(ChartId::Latency, W, 148.0, 13.0).clone();
+        assert!(
+            texts(&lat).iter().any(|t| t.starts_with("max ")),
+            "{:?}",
+            texts(&lat)
+        );
+        let tp = core.scene(ChartId::Throughput, W, 196.0, 13.0).clone();
+        let dots: usize = tp
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Dots { range, .. } => Some((range.end - range.start) as usize),
+                _ => None,
+            })
+            .sum();
+        let n = core.with_session(|s| s.requests.iter().filter(|r| r.bps.is_some()).count());
+        assert!(n > 0);
+        assert_eq!(dots, n);
+        // Zoomed in on one cycle, the bins are back.
+        let (t, end) = core.with_session(|s| (s.requests.get(0).map_or(0.0, |r| r.t_end), s.now()));
+        let plot = time_plot(W, 1.0);
+        let x = plot.x0 + (t / end.unwrap_or(1.0)) as f32 * plot.width();
+        core.zoom(3.0 * 3600.0 / 20.0, x, W);
+        let tp = core.scene(ChartId::Throughput, W, 196.0, 13.0).clone();
+        assert!(tp.prims.iter().any(|p| matches!(p, Prim::Area { .. })));
+    }
+
+    #[test]
+    fn live_charts_redraw_once_per_point() {
+        let mut core = core_with(600.0);
+        let d = core.live_interval(W).expect("following a live run");
+        let per_pt = 600.0 / f64::from(time_plot(W, 1.0).width());
+        assert!((d.as_secs_f64() - per_pt).abs() < 0.01, "{d:?}");
+        core.pan(100.0, W);
+        core.zoom(4.0, W / 2.0, W);
+        core.pan(100.0, W);
+        assert_eq!(core.live_interval(W), None, "not following");
     }
 
     #[test]

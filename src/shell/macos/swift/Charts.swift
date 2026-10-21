@@ -8,12 +8,22 @@ final class SceneDraw {
     enum Op {
         case stroke(Path, color: Int, alpha: Double, width: CGFloat, dashed: Bool)
         case fill(Path, color: Int, alpha: Double)
-        case text(String, at: CGPoint, size: CGFloat, color: Int, anchor: UnitPoint)
+        case text(Label, at: CGPoint, anchor: UnitPoint)
+    }
+
+    /// A piece of chart text. Drawn as a Canvas symbol, so SwiftUI keeps
+    /// it typeset across redraws while only its position changes.
+    struct Label: Hashable {
+        let text: String
+        let size: CGFloat
+        let color: Int
     }
 
     let generation: UInt64
     let plot: CGRect
     let ops: [Op]
+    /// Every distinct label in `ops`.
+    let labels: [Label]
 
     @MainActor
     init(_ s: RstScene, model: Model) {
@@ -28,6 +38,7 @@ final class SceneDraw {
             CGPoint(x: CGFloat(pts[2 * i]), y: CGFloat(pts[2 * i + 1]))
         }
         var ops: [Op] = []
+        var labels = Set<Label>()
         ops.reserveCapacity(cmds.count)
         for c in cmds {
             let (a, b) = (Int(c.start), Int(c.end))
@@ -72,33 +83,44 @@ final class SceneDraw {
                 let s = String(decoding: UnsafeBufferPointer(rebasing: text[a..<b]), as: UTF8.self)
                 let h = CGFloat((c.flags >> 2) & 3) / 2
                 let v = CGFloat((c.flags >> 4) & 3) / 2
+                let label = Label(
+                    text: s, size: c.flags & 3 == 0 ? Theme.small : Theme.body,
+                    color: Int(c.color))
+                labels.insert(label)
                 ops.append(
                     .text(
-                        s, at: CGPoint(x: CGFloat(c.x0), y: CGFloat(c.y0)),
-                        size: c.flags & 3 == 0 ? Theme.small : Theme.body, color: Int(c.color),
+                        label, at: CGPoint(x: CGFloat(c.x0), y: CGFloat(c.y0)),
                         anchor: UnitPoint(x: h, y: v)))
             default:
                 break
             }
         }
         self.ops = ops
+        self.labels = Array(labels)
     }
 
     @MainActor
     func draw(_ ctx: inout GraphicsContext, model: Model) {
         let dash = (model.fixed?.dash ?? [4, 3]).map { CGFloat($0) }
+        // The palette's colours adapt to the appearance; resolve each once
+        // per draw rather than once per shape.
+        let env = ctx.environment
+        let colors = model.colors.map { Color($0.resolve(in: env)) }
+        func color(_ token: Int) -> Color {
+            colors.indices.contains(token) ? colors[token] : .primary
+        }
         for op in ops {
             switch op {
             case .stroke(let path, let c, let a, let w, let dashed):
                 ctx.stroke(
-                    path, with: .color(model.color(c).opacity(a)),
+                    path, with: .color(color(c).opacity(a)),
                     style: StrokeStyle(lineWidth: w, lineJoin: .round, dash: dashed ? dash : []))
             case .fill(let path, let c, let a):
-                ctx.fill(path, with: .color(model.color(c).opacity(a)))
-            case .text(let s, let at, let size, let c, let anchor):
-                ctx.draw(
-                    Text(s).font(.system(size: size)).monospacedDigit()
-                        .foregroundStyle(model.color(c)), at: at, anchor: anchor)
+                ctx.fill(path, with: .color(color(c).opacity(a)))
+            case .text(let label, let at, let anchor):
+                if let sym = ctx.resolveSymbol(id: label) {
+                    ctx.draw(sym, at: at, anchor: anchor)
+                }
             }
         }
     }
@@ -114,11 +136,15 @@ struct ChartView: View {
     private let size = State<CGSize>(initialValue: .zero)
     private let dragX = State<CGFloat>(initialValue: 0)
     private let magnify = State<CGFloat>(initialValue: 1)
+    /// Where the pointer is, so the hover follows a scene that moves
+    /// under a still pointer (a live chart scrolling).
+    private let pointer = State<CGPoint?>(initialValue: nil)
 
     var body: some View {
         // Ask the core on every data update; redraw only when its scene for
         // this chart was rebuilt.
         let _ = model.dataVersion
+        let _ = kind.isTime ? model.clock : 0
         let sz = size.wrappedValue
         let draw = sz.width > 0 && sz.height > 0 ? model.scene(kind, sz) : nil
         ZStack(alignment: .topLeading) {
@@ -136,15 +162,22 @@ struct ChartView: View {
         }
         .frame(height: height)
         .onGeometryChange(for: CGSize.self) { $0.size } action: { size.wrappedValue = $0 }
+        .onChange(of: draw?.generation) {
+            if let p = pointer.wrappedValue {
+                hover.wrappedValue = model.hover(kind, size.wrappedValue, p)
+            }
+        }
         .contentShape(Rectangle())
         .onContinuousHover { phase in
             let s = size.wrappedValue
             switch phase {
             case .active(let p):
                 model.hovered = (kind, s.width, p.x)
+                pointer.wrappedValue = p
                 hover.wrappedValue = model.hover(kind, s, p)
             case .ended:
                 model.hovered = nil
+                pointer.wrappedValue = nil
                 hover.wrappedValue = nil
             }
         }
@@ -188,7 +221,16 @@ private struct SceneCanvas: View, Equatable {
     }
 
     var body: some View {
-        Canvas { ctx, _ in draw?.draw(&ctx, model: model) }
+        Canvas { ctx, _ in
+            draw?.draw(&ctx, model: model)
+        } symbols: {
+            ForEach(draw?.labels ?? [], id: \.self) { l in
+                Text(l.text).font(.system(size: l.size)).monospacedDigit()
+                    .foregroundStyle(model.color(l.color))
+                    .fixedSize()
+                    .tag(l)
+            }
+        }
     }
 }
 

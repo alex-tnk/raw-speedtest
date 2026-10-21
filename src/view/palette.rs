@@ -98,6 +98,18 @@ pub const HOVER_PX: f32 = 6.0;
 /// Farthest a crosshair snaps to a sample.
 pub const SNAP_PX: f32 = 40.0;
 pub const LOSS_TICK: f32 = 8.0;
+/// Lane under the latency plot that holds the loss ticks, so they never
+/// sit on the data.
+pub const LOSS_LANE: f32 = LOSS_TICK + S4;
+/// Width of one column when dense samples are drawn as a per-column
+/// range band and median line.
+pub const COLUMN: f32 = 2.0;
+/// Full-range and interquartile bands of dense samples.
+pub const RANGE_ALPHA: f32 = 0.12;
+pub const IQR_ALPHA: f32 = 0.3;
+/// Below this average width, requests are drawn as one point each (their
+/// throughput) instead of their 50 ms bins.
+pub const REQUEST_MIN_WIDTH: f32 = 4.0;
 /// Below this spacing between samples, chart points are not dotted.
 pub const DOT_MIN_SPACING: f32 = 6.0;
 /// Value axis labels left of a time-series plot.

@@ -86,6 +86,10 @@ void rst_command(RstCore *core, uint32_t cmd);
 /// 0 zoom by `factor` at `x`, 1 pan by `x` points, 2 center the overview on
 /// `x`; `w` is the chart's width.
 void rst_view(RstCore *core, uint32_t op, double factor, float x, float w);
+/// While the time charts follow a live run: milliseconds until their time
+/// axis has moved one point in a chart `w` wide; redraw then to scroll
+/// smoothly. 0 when it isn't moving.
+uint32_t rst_live_ms(RstCore *core, float w);
 /// Choose option `index` of setting `setting`.
 void rst_set(RstCore *core, uint32_t setting, uint32_t index);
 /// Log rows [first, first + count) of tab 0 requests, 1 connections,
