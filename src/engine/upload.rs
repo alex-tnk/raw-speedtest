@@ -1,3 +1,4 @@
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use super::download::{Sink, Spec};
@@ -27,16 +28,21 @@ pub fn run(
     let acked_base = plat.tcp_stats(conn.socket()).and_then(|s| s.bytes_acked);
     let start = Instant::now();
     let mut prev = 0;
+    let mut prev_written = 0;
     let mut written = 0u64;
     let mut acked: Option<u64> = None;
     let deadline = Some(start + spec.limit);
     let r = conn.post(
         cloudflare::UP_PATH,
         spec.size,
-        &|| ctx.interrupted(),
+        &|| sink.abort(ctx),
         deadline,
         &mut |_, w, sock| {
             written = w;
+            if let Some(total) = sink.written {
+                total.fetch_add(w.saturating_sub(prev_written), Ordering::Relaxed);
+                prev_written = w;
+            }
             let stats = plat.tcp_stats(sock);
             let a = stats.and_then(|s| match (acked_base, s.bytes_acked, s.send_queue_bytes) {
                 (Some(base), Some(now), _) => Some(now.saturating_sub(base)),

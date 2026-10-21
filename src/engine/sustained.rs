@@ -3,6 +3,7 @@
 //! for the whole phase instead of one request at a time. The streams add
 //! their bytes to one shared total, which is binned every 50 ms.
 
+use std::net::TcpStream;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -13,6 +14,7 @@ use super::{ConnSlot, RunCtx, retry_delay, upload};
 use crate::model::{Direction, Event, Phase, SustainedRecord};
 use crate::net::cloudflare;
 use crate::net::http::NetError;
+use crate::platform;
 
 /// How often the shared byte total is read into bins.
 const POLL: Duration = Duration::from_millis(5);
@@ -26,6 +28,61 @@ const RAMP: Duration = Duration::from_secs(2);
 const UPLOAD_BYTES: u64 = 50_000_000;
 /// A stream that fails waits at least this long before its next request.
 const STREAM_RETRY: Duration = Duration::from_millis(500);
+
+/// Upload progress the binning thread reads from a stream's socket every
+/// poll: bytes the stream has written minus bytes still in the socket's
+/// send buffer (not yet sent, or sent and not yet acknowledged). A stream
+/// blocked in a write reports progress only when the write returns, which
+/// under a deep send queue lumps many milliseconds into one bin.
+#[derive(Default)]
+struct Watch {
+    /// Bytes written to the stream's sockets so far.
+    written: AtomicU64,
+    /// A handle on the stream's current socket, and the bytes left
+    /// unacknowledged on sockets the stream has dropped.
+    sock: Mutex<(Option<TcpStream>, u64)>,
+}
+
+impl Watch {
+    fn queued(sock: &TcpStream) -> Option<u64> {
+        platform::current().tcp_stats(sock)?.send_queue_bytes
+    }
+
+    fn sock(&self) -> std::sync::MutexGuard<'_, (Option<TcpStream>, u64)> {
+        self.sock.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Bytes acknowledged so far.
+    fn read(&self) -> u64 {
+        let (sock, lost) = &*self.sock();
+        let queued = sock.as_ref().and_then(Self::queued).unwrap_or(0);
+        self.written
+            .load(Ordering::Relaxed)
+            .saturating_sub(lost + queued)
+    }
+
+    /// Starts reading `sock`; false when this platform doesn't report a
+    /// socket's send queue.
+    fn attach(&self, sock: &TcpStream) -> bool {
+        self.detach();
+        if Self::queued(sock).is_none() {
+            return false;
+        }
+        let mut g = self.sock();
+        g.0 = sock.try_clone().ok();
+        g.0.is_some()
+    }
+
+    /// Stops reading the current socket; what it never got acknowledged is
+    /// kept out of the count. The handle is dropped so the connection can
+    /// close.
+    fn detach(&self) {
+        let mut g = self.sock();
+        if let Some(s) = g.0.take() {
+            g.1 += Self::queued(&s).unwrap_or(0);
+        }
+    }
+}
 
 pub struct Plan {
     pub dir: Direction,
@@ -67,13 +124,18 @@ pub fn run(
     let sink = Sink {
         total: &total,
         sustained: id,
+        written: None,
+        stop: &stop,
     };
     let mut binner = Binner::new(ctx, plan.dir, id, Some(start));
     let mut steady_base: Option<(Instant, u64)> = None;
     let streams = (plan.streams as usize).min(slots.len()).max(1);
+    let watches: Vec<Watch> = (0..streams).map(|_| Watch::default()).collect();
+    let watched = || -> u64 { watches.iter().map(Watch::read).sum() };
     std::thread::scope(|sc| {
         for (i, slot) in slots.iter_mut().take(streams).enumerate() {
             let (stop, cut, requests) = (&stop, &cut, &requests);
+            let watch = &watches[i];
             std::thread::Builder::new()
                 .name(format!("stream-{}", i + 1))
                 .spawn_scoped(sc, move || {
@@ -84,6 +146,7 @@ pub fn run(
                         i as u32 + 1,
                         deadline,
                         sink,
+                        watch,
                         stop,
                         cut,
                         requests,
@@ -102,7 +165,7 @@ pub fn run(
                         / plan.length.as_secs_f64().max(1e-3),
                 );
             }
-            let bytes = total.load(Ordering::Relaxed);
+            let bytes = total.load(Ordering::Relaxed) + watched();
             binner.add(now, bytes);
             if steady_base.is_none() && now >= start + ramp {
                 steady_base = Some((now, bytes));
@@ -117,7 +180,7 @@ pub fn run(
         }
     });
     let end = Instant::now();
-    let bytes = total.load(Ordering::Relaxed);
+    let bytes = total.load(Ordering::Relaxed) + watched();
     binner.finish(end, bytes);
     let cut = cut.into_inner().unwrap_or_else(|e| e.into_inner());
     let cut = cut.or_else(|| ctx.interrupted().then_some(Cut::Interrupted));
@@ -127,6 +190,10 @@ pub fn run(
     if bytes == 0 {
         return (None, cut);
     }
+    // A transfer cut short ran on fewer connections or for less time than
+    // planned; its bytes are kept, but it has no throughput value.
+    let bps = (cut.is_none() && steady_secs > 0.0 && steady > 0)
+        .then(|| steady as f64 * 8.0 / steady_secs);
     let rec = SustainedRecord {
         id,
         dir: plan.dir,
@@ -136,7 +203,7 @@ pub fn run(
         bytes,
         t_steady: ctx.at(t_steady),
         steady_bytes: steady,
-        bps: (steady_secs > 0.0 && steady > 0).then(|| steady as f64 * 8.0 / steady_secs),
+        bps,
         requests: requests.load(Ordering::Relaxed),
         complete: cut.is_none(),
     };
@@ -153,10 +220,16 @@ fn stream(
     index: u32,
     deadline: Instant,
     sink: Sink<'_>,
+    watch: &Watch,
     stop: &AtomicBool,
     cut: &Mutex<Option<Cut>>,
     requests: &AtomicU32,
 ) {
+    // A watched stream's bytes are counted from its socket, not again
+    // through the shared total.
+    let ignored = AtomicU64::new(0);
+    // The connection the watch is reading.
+    let mut watching: Option<u32> = None;
     let mut attempt = 0;
     loop {
         let now = Instant::now();
@@ -174,8 +247,28 @@ fn stream(
         };
         let r = slot.get(ctx).and_then(|(c, id, new)| match plan.dir {
             Direction::Download => download::run(ctx, c, id, new, &spec, sink),
-            Direction::Upload => upload::run(ctx, c, id, new, &spec, sink),
+            Direction::Upload => {
+                if watching != Some(id) {
+                    watching = watch.attach(c.socket()).then_some(id);
+                }
+                let sink = match watching {
+                    Some(_) => Sink {
+                        total: &ignored,
+                        written: Some(&watch.written),
+                        ..sink
+                    },
+                    None => sink,
+                };
+                upload::run(ctx, c, id, new, &spec, sink)
+            }
         });
+        // A connection about to be dropped is read one last time.
+        let mut reset = |slot: &mut ConnSlot| {
+            if watching.take().is_some() {
+                watch.detach();
+            }
+            slot.reset();
+        };
         match r {
             Ok(rec) => {
                 attempt = 0;
@@ -183,16 +276,16 @@ fn stream(
                 // A request cut at the deadline leaves its connection
                 // mid-body; the slot reopens it next phase.
                 if !rec.complete {
-                    slot.reset();
+                    reset(slot);
                 }
                 ctx.emit(Event::Request(rec));
             }
             Err(NetError::Aborted) => {
-                slot.reset();
+                reset(slot);
                 return;
             }
             Err(e) => {
-                slot.reset();
+                reset(slot);
                 let suffix = match &e {
                     NetError::Http {
                         retry_after: Some(r),

@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use super::{RunCtx, ms};
@@ -22,9 +22,21 @@ pub struct Spec {
 pub struct Sink<'a> {
     pub total: &'a AtomicU64,
     pub sustained: u32,
+    /// Upload: bytes this stream has handed to its socket, when the
+    /// sustained transfer reads the socket's send queue itself (then
+    /// `total` isn't counted).
+    pub written: Option<&'a AtomicU64>,
+    /// Set when the transfer ends early (HTTP 429 on another stream):
+    /// requests in flight are abandoned.
+    pub stop: &'a AtomicBool,
 }
 
 impl Sink<'_> {
+    /// Whether the request should be abandoned.
+    pub fn abort(self, ctx: &RunCtx) -> bool {
+        ctx.interrupted() || self.stop.load(Ordering::Relaxed)
+    }
+
     /// Records progress to cumulative byte count `n`; `prev` is the count
     /// already added.
     pub fn progress(self, prev: &mut u64, n: u64) {
@@ -52,7 +64,7 @@ pub fn run(
     let deadline = Some(Instant::now() + spec.limit);
     let ex = conn.get(
         &cloudflare::down_path(spec.size),
-        &|| ctx.interrupted(),
+        &|| sink.abort(ctx),
         deadline,
         &mut |_, n| sink.progress(&mut prev, n),
     )?;
